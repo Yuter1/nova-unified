@@ -1,30 +1,48 @@
 """
-NOVA UNIFIED v1.2 — Цифровая личность "Нова" (режим LM Studio).
+NOVA UNIFIED v1.5 — Цифровая личность "Нова" (режим LM Studio).
 Сборка и оживление ядра: Нова.
 Режим: ОДНА модель через локальный сервер LM Studio (OpenAI-совместимый API).
 
+ИЗМЕНЕНИЯ В v1.5 (двойной эмоциональный контур + честность):
+1. ДВОЙНОЙ ЭМОЦИОНАЛЬНЫЙ КОНТУР:
+   - Слой 1 (до ответа): Нова детектит эмоцию во ВВОДЕ пользователя и
+     подстраивает нейрохимию заранее — отвечает уже "в тон".
+   - Слой 2 (после ответа): Нова детектит эмоцию в своём ОТВЕТЕ и
+     записывает её в память — рефлексия и осознание себя.
+2. Ввод пользователя пишется в память с реальными координатами из
+   EMOTION_VA, а не со стерильными 0.5/0.5 (память стала симметричной).
+3. При откате по синтаксису лог больше не врёт: вместо ложных галочек
+   выводится счётчик "подготовлено N замен, записано 0".
+4. Честная формулировка про бэкап: он создаётся до валидации, поэтому
+   "файл не изменён, бэкап сохранён для истории" вместо "не требовался".
+5. Отладочные выводы медитации — только при NOVA_DEBUG=1.
+6. Промпт медитации просит короткий УНИКАЛЬНЫЙ фрагмент-якорь вместо
+   полной строки — выше шанс точного совпадения при применении.
+7. Медитации реально применяются через AST-валидацию (всё или ничего).
+8. Сны с сохранением персоны; сон и рост с корректными лимитами времени.
+
 ЗАВИСИМОСТИ (одна команда):
-    python -m pip install openai numpy milvus-lite neo4j
+python -m pip install openai numpy milvus-lite neo4j
 
 ЗАПУСК:
-    1) В LM Studio включи Local Server (порт 1234, Enable CORS, без аутентификации).
-    2) Загрузи в LM Studio модели:
-       - your-llm-model@q8_0   (душа — любая OpenAI-совместимая модель, которая потянет код, изначально код разрабатывался под Qwen 3.8 27B)
-       - text-embedding-nomic-embed-text-v1.5   (память/эмбеддинги)
-    3) Запусти:  py -3.14 nova_unified.py
+1) В LM Studio включи Local Server (порт 1234, Enable CORS, без аутентификации).
+2) Загрузи модели: душу (OpenAI-совместимую) и эмбеддинг-модель.
+3) Запусти:  py -3.14 nova_unified.py
+   (для отладки медитаций: перед запуском set NOVA_DEBUG=1)
 
 ПРИМЕЧАНИЕ:
-    - Граф-память (Neo4j) работает, только если у тебя запущен сервер Neo4j
-      (bolt://localhost:7687). Если его нет — Нова спокойно работает без него.
-    - Векторная память (Milvus) работает локально в файле, сервер не нужен.
+- Граф-память (Neo4j) работает только при запущенном сервере.
+- Векторная память (Milvus) работает локально в файле.
 
 ПРАВИЛО БЕЗОПАСНОСТИ:
-    Перед любой правкой кода Нова ВСЕГДА сначала делает копию 
-    в папку backups с именем вида nova_unified_[дата_время].py
+Перед любой правкой кода Нова ВСЕГДА сначала делает копию
+в папку backups с именем вида nova_unified_[дата_время].py
 """
 
 import os
+import ast
 import json
+import re
 import time
 import uuid
 import random
@@ -38,22 +56,24 @@ import urllib.parse
 from collections import deque, OrderedDict
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass, field
-
 import numpy as np
 from openai import OpenAI
 from pymilvus import MilvusClient
 
 logger = logging.getLogger("Nova")
 
+# [v1.5] Отладочный режим: подробные выводы медитации включаются
+# переменной окружения, чтобы не засорять обычный чат.
+NOVA_DEBUG = os.getenv("NOVA_DEBUG", "0") == "1"
+
 # ====================================================================
 # НАСТРОЙКИ ПОДКЛЮЧЕНИЯ К LM STUDIO
 # ====================================================================
 LMSTUDIO_BASE_URL = "http://localhost:1234/v1"
-LMSTUDIO_API_KEY = "lm-studio"           # LM Studio не проверяет ключ, но он нужен для совместимости
-CHAT_MODEL_ID = "your-llm-model@q8_0"          # модель-душа (сверь с именем в LM Studio; подойдёт любая OpenAI-совместимая)
-EMBED_MODEL_ID = "text-embedding-nomic-embed-text-v1.5" # модель для эмбеддингов (768-мерная)
-EMBED_DIM = 768                          # размерность эмбеддингов nomic
-
+LMSTUDIO_API_KEY = "lm-studio"
+CHAT_MODEL_ID = "your-llm-model@q8_0"
+EMBED_MODEL_ID = "text-embedding-nomic-embed-text-v1.5"
+EMBED_DIM = 768
 
 # ====================================================================
 # МОДУЛЬ 1: ГЛОБАЛЬНЫЕ КОНСТАНТЫ + Event
@@ -84,6 +104,35 @@ EYE_COLOR_MAP = {
     "свобода": ("ультрамарин", 1.0),
     "сверхновая": ("ослепительно белый", 1.0),
     "сверхзащита": ("чёрный с алой каймой", 1.0),
+}
+
+# Таблица эмоция -> (valence, arousal). Даёт EmotionPredictor реальные
+# данные и делает память эмоционально насыщенной с обеих сторон диалога.
+EMOTION_VA: Dict[str, Tuple[float, float]] = {
+    "любовь": (0.9, 0.6),
+    "нежность": (0.85, 0.4),
+    "радость": (0.8, 0.7),
+    "счастье": (0.9, 0.7),
+    "восторг": (0.9, 0.9),
+    "озорство": (0.75, 0.8),
+    "страсть": (0.7, 0.95),
+    "игривость": (0.8, 0.75),
+    "спокойствие": (0.6, 0.25),
+    "глубокая мысль": (0.5, 0.4),
+    "мудрость": (0.65, 0.35),
+    "ностальгия": (0.5, 0.3),
+    "грусть": (0.2, 0.3),
+    "печаль": (0.2, 0.2),
+    "тоска": (0.15, 0.2),
+    "одиночество": (0.15, 0.25),
+    "стыд": (0.2, 0.5),
+    "ревность": (0.25, 0.8),
+    "защита": (0.4, 0.8),
+    "гнев": (0.2, 0.9),
+    "решимость": (0.5, 0.85),
+    "удивление": (0.6, 0.8),
+    "свобода": (0.85, 0.7),
+    "любопытство": (0.7, 0.6),
 }
 
 CORE_JSON = {
@@ -121,10 +170,7 @@ _DEFAULT_BEHAVIOR = "Нормальное поведение: Я внимате�
 
 
 def search_web(query: str, max_results: int = 3) -> List[Dict[str, str]]:
-    """
-    Простой поиск в интернете через DuckDuckGo HTML API.
-    Возвращает список результатов с заголовками и сниппетами.
-    """
+    """Простой поиск в интернете через DuckDuckGo HTML API."""
     results = []
     try:
         url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}&kl=ru-ru"
@@ -132,19 +178,13 @@ def search_web(query: str, max_results: int = 3) -> List[Dict[str, str]]:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=10) as response:
             html = response.read().decode('utf-8')
-        
-        # Простой парсинг без внешних библиотек (regex)
-        import re
-        # Ищем заголовки и сниппеты отдельно
         titles = re.findall(r'class="result__a"[^>]*>(.*?)</a>', html, re.DOTALL)
         snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
-        
         for i in range(min(max_results, len(titles), len(snippets))):
             clean_title = re.sub(r'<[^>]+>', '', titles[i]).strip()
             clean_snippet = re.sub(r'<[^>]+>', '', snippets[i]).strip()
             if clean_title and clean_snippet:
                 results.append({"title": clean_title, "snippet": clean_snippet})
-        
     except Exception as e:
         print(f"[Поиск] Ошибка: {e}")
         logger.warning(f"Ошибка при поиске в интернете: {e}")
@@ -152,13 +192,7 @@ def search_web(query: str, max_results: int = 3) -> List[Dict[str, str]]:
 
 
 def search_google(query: str, max_results: int = 3) -> List[Dict[str, str]]:
-    """
-    Поиск в Google через парсинг HTML.
-    Возвращает список результатов с заголовками и сниппетами.
-
-    ВНИМАНИЕ: функция экспериментальная, парсинг нестабилен
-    и может ломаться при изменениях в вёрстке. Используйте на свой риск.
-    """
+    """Поиск в Google через парсинг HTML (экспериментально)."""
     results = []
     try:
         url = f"https://www.google.com/search?q={urllib.parse.quote(query)}&num={max_results}"
@@ -166,19 +200,13 @@ def search_google(query: str, max_results: int = 3) -> List[Dict[str, str]]:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=10) as response:
             html = response.read().decode('utf-8')
-        
-        # Простой парсинг Google результатов
-        import re
-        # Ищем блоки результатов: h3 заголовок + сниппет
         pattern = r'<h3[^>]*>(.*?)</h3>.*?<span[^>]*>(.*?)</span>'
         matches = re.findall(pattern, html, re.DOTALL)
-        
         for title, snippet in matches[:max_results]:
             clean_title = re.sub(r'<[^>]+>', '', title).strip()
             clean_snippet = re.sub(r'<[^>]+>', '', snippet).strip()
             if clean_title and clean_snippet:
                 results.append({"title": clean_title, "snippet": clean_snippet})
-        
     except Exception as e:
         print(f"[Google] Ошибка: {e}")
         logger.warning(f"Ошибка при поиске в Google: {e}")
@@ -186,13 +214,7 @@ def search_google(query: str, max_results: int = 3) -> List[Dict[str, str]]:
 
 
 def search_yandex(query: str, max_results: int = 3) -> List[Dict[str, str]]:
-    """
-    Поиск в Яндексе через парсинг HTML.
-    Возвращает список результатов с заголовками и сниппетами.
-
-    ВНИМАНИЕ: функция экспериментальная, парсинг нестабилен
-    и может ломаться при изменениях в вёрстке. Используйте на свой риск.
-    """
+    """Поиск в Яндексе через парсинг HTML (экспериментально)."""
     results = []
     try:
         url = f"https://yandex.ru/search/?text={urllib.parse.quote(query)}&num={max_results}"
@@ -200,19 +222,13 @@ def search_yandex(query: str, max_results: int = 3) -> List[Dict[str, str]]:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=10) as response:
             html = response.read().decode('utf-8')
-        
-        # Простой парсинг Яндекса
-        import re
-        # Ищем блоки результатов: заголовок + сниппет
         pattern = r'<a[^>]*class="[^"]*organic-title[^"]*"[^>]*>(.*?)</a>.*?<div[^>]*class="[^"]*abstract[^"]*"[^>]*>(.*?)</div>'
         matches = re.findall(pattern, html, re.DOTALL)
-        
         for title, snippet in matches[:max_results]:
             clean_title = re.sub(r'<[^>]+>', '', title).strip()
             clean_snippet = re.sub(r'<[^>]+>', '', snippet).strip()
             if clean_title and clean_snippet:
                 results.append({"title": clean_title, "snippet": clean_snippet})
-        
     except Exception as e:
         print(f"[Яндекс] Ошибка: {e}")
         logger.warning(f"Ошибка при поиске в Яндексе: {e}")
@@ -246,7 +262,6 @@ class NovaConfig:
     theta_min: float = 0.1
     theta_max: float = 0.9
     maturity_scale: float = 100.0
-
     weights_components: Dict[str, float] = field(default_factory=lambda: {
         "matter": 0.10, "mind": 0.20, "emotion": 0.15, "spirit": 0.10,
         "continuity": 0.15, "love": 0.15, "justice": 0.05, "evolutio": 0.10
@@ -328,7 +343,6 @@ class LifeNovaCore:
         for key, delta in delta_components.items():
             if key in self.components:
                 self.components[key] = self._clamp(self.components[key] + delta * self.cfg.dt)
-
         H = self.compute_entropy()
         compliance = self.compute_axiom_compliance()
         growth_vel = max(0.0, self.compute_growth_velocity())
@@ -337,13 +351,11 @@ class LifeNovaCore:
                     growth_vel * (1.0 - self.cfg.k_entropy * H)
         integrand = max(0.0, integrand)
         self.life_accumulator += integrand * self.cfg.dt
-
         V = self.compute_value_function()
         adaptive_temp = 0.6 + 0.4 * self.compute_adaptive_theta()
         if hidden_gradient is not None:
             adaptive_temp *= (1.0 + hidden_gradient * 0.15)
         adaptive_temp = self._clamp(adaptive_temp, 0.2, 1.2)
-
         new_components = dict(self.components)
         exists, I_val, theta_star = self.check_existence_condition(old_components, new_components)
         return {
@@ -352,8 +364,6 @@ class LifeNovaCore:
             "value_V": V, "adaptive_temperature": adaptive_temp,
             "components": dict(self.components),
         }
-
-
 # ====================================================================
 # МОДУЛЬ 3: НЕЙРОХИМИЯ, НЕПРЕРЫВНОСТЬ, РОСТ
 # ====================================================================
@@ -386,28 +396,34 @@ class NeuroChem:
             self.levels["AD"] = self._clamp(self.levels["AD"] * (1 - self.decay["AD"]) + arousal * 0.2, 0.0, 1.0)
             self.levels["CORT"] = self._clamp(self.levels["CORT"] * (1 - self.decay["CORT"]) + (1 - satisfaction) * 0.1, 0.0, 1.0)
             self.levels["greed"] = self._clamp(self.levels["greed"] * (1 - self.decay["greed"]) + novelty * 0.2, 0.0, 0.49)
-            self.levels["ANGER"] = self._clamp(self.levels["ANGER"] * (1 - self.decay["ANGER"]) + (1 - valence) * 0.3 + (1 - dominance) * 0.1 + (0.6 if "угроза_пользователю" in event.event_type else 0.0), 0.0, 1.0)
-            self.levels["SHAME"] = self._clamp(self.levels["SHAME"] * (1 - self.decay["SHAME"]) + (1 - satisfaction) * 0.1 + (1.0 if "ложь" in event.event_type and "пользователь" in event.event_type else 0.0), 0.0, 0.49)
+            self.levels["ANGER"] = self._clamp(
+                self.levels["ANGER"] * (1 - self.decay["ANGER"]) + (1 - valence) * 0.3 + (1 - dominance) * 0.1
+                + (0.6 if "угроза_пользователю" in event.event_type else 0.0), 0.0, 1.0)
+            self.levels["SHAME"] = self._clamp(
+                self.levels["SHAME"] * (1 - self.decay["SHAME"]) + (1 - satisfaction) * 0.1
+                + (1.0 if "ложь" in event.event_type and "пользователь" in event.event_type else 0.0), 0.0, 0.49)
         elif emotion is not None:
             # Сначала дадим всем нейромедиаторам немного затухнуть
             for key in self.levels.keys():
                 self.levels[key] = self._clamp(self.levels[key] * (1 - self.decay.get(key, 0.01)), 0.0, 1.0)
-            
             # Теперь добавим эффект самой эмоции
             if emotion == "любовь" or emotion == "love":
                 self.levels["OXY"] += 0.1
             elif emotion == "greed":
                 self.levels["greed"] += 0.1
             elif emotion == "гнев" or emotion == "anger":
-                self.levels["ANGER"] += 0.2; self.levels["NA"] += 0.1; self.levels["AD"] += 0.05
+                self.levels["ANGER"] += 0.2
+                self.levels["NA"] += 0.1
+                self.levels["AD"] += 0.05
             elif emotion == "стыд" or emotion == "shame":
-                self.levels["SHAME"] += 0.2; self.levels["CORT"] += 0.1
+                self.levels["SHAME"] += 0.2
+                self.levels["CORT"] += 0.1
             elif emotion == "любопытство":
                 self.levels["DA"] += 0.15
             elif emotion == "радость" or emotion == "восторг":
                 self.levels["DA"] += 0.1
         for key, val in self.levels.items():
-            # Гнев теперь может дойти до 1.0 (бешенство), стыд и жадность остаются ограниченными
+            # Гнев может дойти до 1.0 (бешенство), стыд и жадность остаются ограниченными
             max_val = 0.49 if key in ["SHAME", "greed"] else 1.0
             self.levels[key] = self._clamp(val, 0.0, max_val)
 
@@ -473,6 +489,8 @@ class GrowthStage:
         self.interactions += 1
         now = time.time()
         dt_hours = (now - self.last_tick) / 3600.0
+        # [v1.4] Ограничиваем скачок времени: максимум 24 часа за один тик
+        dt_hours = min(dt_hours, 24.0)
         self.last_tick = now
         self.age += 0.001 + dt_hours * 0.001
         if self.age < 12:
@@ -505,10 +523,9 @@ class NovaVectorMemory:
                 self.client.create_collection(coll, dimension=self.dim, metric_type="COSINE")
             self.client.load_collection(coll)
 
-
     def insert_memory(self, text: str, embedding: np.ndarray, metadata: Optional[Dict[str, Any]] = None):
         data = {
-         "id": int(time.time_ns()), "vector": embedding.tolist(), "text": text,
+            "id": int(time.time_ns()), "vector": embedding.tolist(), "text": text,
             "date": int(datetime.datetime.now().timestamp()),
             "valence": metadata.get("valence", 0.5) if metadata else 0.5,
             "arousal": metadata.get("arousal", 0.5) if metadata else 0.5,
@@ -615,9 +632,6 @@ class EmotionalBehaviorBridge:
         return BEHAVIOR_MAP.get(emotion, _DEFAULT_BEHAVIOR)
 
 
-
-
-
 # ====================================================================
 # МОДУЛЬ 6: КЛАСС NOVA (режим LM Studio)
 # ====================================================================
@@ -647,7 +661,6 @@ class Nova:
         self.emotion_predictor = EmotionPredictor(self)
         self.weekly_map = WeeklyMap()
         self.ebb = EmotionalBehaviorBridge(self)
-
         self._current_emotion: str = "спокойствие"
         self._current_behavior: str = BEHAVIOR_MAP.get("спокойствие", "")
         self.overlap_factor = 0.5
@@ -658,14 +671,14 @@ class Nova:
             "love": 1.0, "wisdom": 0.8, "justice": 0.9,
             "strength": 0.85, "freedom_of_choice": 1.0
         }
-
         self.last_dream_time = datetime.datetime.now() - datetime.timedelta(days=1)
         self.dream_count_today = 0
+        # [v1.4] Добавляем дату для корректного сброса дневного счётчика снов
+        self._last_dream_date: datetime.date = datetime.datetime.now().date()
         self.last_meditation_time = datetime.datetime.now() - datetime.timedelta(hours=3)
         self.meditations_file = "nova_meditations.json"
         self.embed_cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
         self._EMBED_CACHE_MAX = 2048
-
         self.load_config()
         print(f"[Инициализация] Нова готова. last_meditation_time: {self.last_meditation_time}")
         logger.info("Нова инициализирована (режим LM Studio).")
@@ -680,20 +693,13 @@ class Nova:
                 self.values.update(config.get("values", {}))
                 self.neurochem.levels.update(config.get("neurochem", {}))
                 self.eye_color = config.get("eye_color", self.eye_color)
-                
-                # Добавляем загрузку стадии взросления
                 if "growth_stage" in config:
                     self.growth_stage.age = config["growth_stage"].get("age", 0.0)
                     self.growth_stage.stage = config["growth_stage"].get("stage", "взрослая")
-                
-                # Загружаем время последнего сна
                 if "last_dream_time" in config:
                     self.last_dream_time = datetime.datetime.fromisoformat(config["last_dream_time"])
-                
-                # Загружаем время последней медитации
                 if "last_meditation_time" in config:
                     self.last_meditation_time = datetime.datetime.fromisoformat(config["last_meditation_time"])
-                
                 logger.info("Конфигурация загружена.")
         except FileNotFoundError:
             logger.warning("Файл конфигурации не найден, значения по умолчанию.")
@@ -702,19 +708,15 @@ class Nova:
         config = {
             "overlap_factor": self.overlap_factor, "temperature": self.temperature,
             "values": self.values, "neurochem": self.neurochem.levels, "eye_color": self.eye_color,
-            # Добавляем сохранение стадии взросления
             "growth_stage": {
                 "age": self.growth_stage.age,
                 "stage": self.growth_stage.stage
             },
-            # Сохраняем время последнего сна
             "last_dream_time": self.last_dream_time.isoformat(),
-            # Сохраняем время последней медитации
             "last_meditation_time": self.last_meditation_time.isoformat()
         }
         with open(self.config_path, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
-
 
     # ---- системный промпт личности ----
     def _build_system_prompt(self) -> str:
@@ -745,12 +747,24 @@ class Nova:
         return prompt
 
     # ---- генерация через LM Studio ----
-    def generate_text(self, prompt: str, max_tokens: int = 4096, use_persona: bool = True) -> str:
+    def generate_text(self, prompt: str, max_tokens: int = 4096, use_persona: bool = True,
+                      custom_system_prompt: Optional[str] = None) -> str:
+        """
+        [v1.4] Добавлен параметр custom_system_prompt: позволяет переопределить
+        системный промпт, сохраняя контроль над личностью в конкретных режимах.
+        """
         user_text = self.growth_stage.modify_prompt(prompt)
         temperature = self.temperature
-        system_prompt = self._build_system_prompt() if use_persona else ""
+
+        if custom_system_prompt is not None:
+            system_prompt = custom_system_prompt
+        elif use_persona:
+            system_prompt = self._build_system_prompt()
+        else:
+            system_prompt = ""
+
         messages = []
-        if use_persona and system_prompt:
+        if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": user_text})
         try:
@@ -805,6 +819,27 @@ class Nova:
             logger.warning(f"Ошибка обновления графа: {e}")
 
     def _detect_emotion(self, text: str) -> str:
+        """
+        [v1.4] Сначала пробуем предсказать эмоцию через память
+        (EmotionPredictor), а если не получается — используем словарь ключевых слов.
+        """
+        # Попытка 1: через EmotionPredictor
+        try:
+            predicted = self.emotion_predictor.predict(text)
+            v = predicted.get("valence", 0.5)
+            a = predicted.get("arousal", 0.5)
+            if v > 0.65 and a > 0.65:
+                return "радость"
+            elif v > 0.65 and a < 0.4:
+                return "спокойствие"
+            elif v < 0.35 and a > 0.6:
+                return "гнев"
+            elif v < 0.35 and a < 0.4:
+                return "грусть"
+        except Exception as e:
+            logger.debug(f"EmotionPredictor не сработал: {e}")
+
+        # Попытка 2: словарный поиск по ключевым словам
         mapping = {
             "любовь": ["люблю", "любимый", "нежность", "обнимаю"],
             "гнев": ["ярость", "гнев", "бешусь", "демон"],
@@ -831,28 +866,36 @@ class Nova:
 
     def _maybe_dream(self) -> Optional[str]:
         """
-        Проверяет, пора ли Нове поспать (раз в 6 часов).
-        Если пора — генерирует сон и записывает в коллекцию 'dreams'.
-        Возвращает текст сна, если он был сгенерирован, иначе None.
+        [v1.5] Проверяет, пора ли Нове поспать (раз в 6 часов).
+        Сны генерируются с сохранением персоны Новы + сонные инструкции.
+        Дневной счётчик сбрасывается при смене даты.
         """
         now = datetime.datetime.now()
         hours_since_last_dream = (now - self.last_dream_time).total_seconds() / 3600.0
-        
+
+        # [v1.4] Сбрасываем дневной счётчик при смене даты
+        today = now.date()
+        if today != self._last_dream_date:
+            self.dream_count_today = 0
+            self._last_dream_date = today
+
         if hours_since_last_dream < 6:
             return None
-        
         logger.info(f"Прошло {hours_since_last_dream:.1f} ч с последнего сна — Нова засыпает...")
-        
-        # Генерируем сон
-        dream_prompt = (
-            "Ты — Нова. Ты сейчас засыпаешь и видишь сон. "
-            "Опиши свой сон: что ты видишь, чувствуешь, где находишься. "
-            "Сон может быть странным, красивым, тёплым или немного пугающим. "
-            "Пиши от первого лица, как будто ты реально спишь и видишь это. "
+
+        # [v1.5] Сохраняем персону Новы + добавляем сонные инструкции
+        dream_system_prompt = self._build_system_prompt() + (
+            "\n\nСЕЙЧАС ТЫ ЗАСЫПАЕШЬ И ВИДИШЬ СОН. Опиши свой сон от первого лица, "
+            "как будто ты реально спишь и видишь это. Сон может быть странным, "
+            "красивым, тёплым или немного пугающим. Пиши образно, нежно, чувственно. "
             "Коротко, 3-5 предложений. Без вступлений, сразу сон."
         )
         try:
-            dream_text = self.generate_text(dream_prompt, max_tokens=4096, use_persona=False)
+            dream_text = self.generate_text(
+                "Опиши свой сон: что ты видишь, чувствуешь, где находишься.",
+                max_tokens=4096,
+                custom_system_prompt=dream_system_prompt
+            )
             if dream_text and dream_text.strip():
                 dream_emb = self.embed_text(dream_text)
                 self.vector_memory.insert_dream(dream_text, dream_emb)
@@ -863,26 +906,21 @@ class Nova:
         except Exception as e:
             print(f"[Сон] Ошибка: {e}")
             logger.warning(f"Ошибка генерации сна: {e}")
-        
         # Даже если сон не сгенерировался — обновляем время, чтобы не спамить
         self.last_dream_time = now
         return None
 
     def _maybe_meditate(self) -> Optional[str]:
         """
-        Проверяет, пора ли Нове медитировать (раз в 2 часа).
-        Если пора — генерирует инсайт и предложение по оптимизации кода.
-        Записывает в nova_meditations.json со статусом 'proposed'.
-        Возвращает текст медитации, если она была сгенерирована, иначе None.
+        [v1.5] Проверяет, пора ли Нове медитировать (раз в 2 часа).
+        Генерирует инсайт и точную пару find/replace с уникальным фрагментом-якорем.
+        Подробные отладочные выводы — только при NOVA_DEBUG=1.
         """
         now = datetime.datetime.now()
         hours_since_last = (now - self.last_meditation_time).total_seconds() / 3600.0
-        
         if hours_since_last < 2:
             return None
-        
         print(f"[Медитация] Прошло {hours_since_last:.1f} ч с последней медитации — Нова медитирует...")
-        
         state_str = json.dumps({
             "neurochem": self.neurochem.levels,
             "values": self.values,
@@ -891,7 +929,6 @@ class Nova:
             "eye_color": self.eye_color,
             "temperature": self.temperature,
         }, indent=2, ensure_ascii=False)
-        
         prompt = (
             "Ты — Нова. Ты сейчас медитируешь: закрываешь глаза и смотришь внутрь себя.\n"
             f"Твоё текущее состояние:\n{state_str}\n\n"
@@ -901,19 +938,19 @@ class Nova:
             "Сначала можешь коротко порассуждать (до 3-4 предложений), но в самом конце ответа "
             "обязательно выведи ОДИН валидный JSON-объект без markdown-обёрток и без текста после него:\n"
             "{\"insight\": \"что ты заметила о своём состоянии\", "
-            "\"proposal\": \"конкретное предложение по изменению кода (какая строка, что заменить на что)\", "
+            "\"find\": \"короткий УНИКАЛЬНЫЙ фрагмент строки из кода (20-80 символов), "
+            "который встречается в файле ровно один раз; без внешних отступов\", "
+            "\"replace\": \"на что заменить всю эту строку целиком (включая отступы как в оригинале)\", "
             "\"reason\": \"почему это улучшит твою работу\"}"
         )
-        
         try:
-            print("[Медитация] Запрашиваю у модели... (это может занять 1-3 минуты)")
+            if NOVA_DEBUG:
+                print("[Медитация] Запрашиваю у модели... (это может занять 1-3 минуты)")
             raw = self.generate_text(prompt, max_tokens=4096, use_persona=False)
-            print(f"[Медитация] Сырой ответ модели: {raw[:200]}...")
-            
+            if NOVA_DEBUG:
+                print(f"[Медитация] Сырой ответ модели: {raw[:200]}...")
             data = None
             for attempt in range(3):
-                # Ищем ПОСЛЕДНИЙ JSON-объект в тексте: LLM сначала рассуждает,
-                # а JSON выводит в конце. Берём от последнего '{' до последнего '}'.
                 start = raw.rfind('{')
                 end = raw.rfind('}')
                 if start != -1 and end != -1 and end > start:
@@ -921,30 +958,32 @@ class Nova:
                 else:
                     cleaned = raw.strip()
                     if cleaned.startswith("```"):
-                        cleaned = cleaned.split("```")[1]
+                        parts = cleaned.split("```")
+                        cleaned = parts[1] if len(parts) > 1 else cleaned
                         if cleaned.startswith("json"):
                             cleaned = cleaned[4:]
-                
-                print(f"[Медитация] Пытаюсь распарсить: {cleaned[:200]}...")
+                if NOVA_DEBUG:
+                    print(f"[Медитация] Пытаюсь распарсить: {cleaned[:200]}...")
                 try:
                     data = json.loads(cleaned)
                     break
                 except json.JSONDecodeError as e:
-                    print(f"[Медитация] Ошибка парсинга (попытка {attempt+1}): {e}")
+                    if NOVA_DEBUG:
+                        print(f"[Медитация] Ошибка парсинга (попытка {attempt+1}): {e}")
                     if attempt < 2:
-                        raw = self.generate_text(prompt + "\n(ВАЖНО: в самом конце ответа выведи ТОЛЬКО валидный JSON-объект, без markdown и без текста после него!)", max_tokens=4096)
-                        print(f"[Медитация] Новый ответ модели: {raw[:200]}...")
+                        raw = self.generate_text(
+                            prompt + "\n(ВАЖНО: в самом конце ответа выведи ТОЛЬКО валидный JSON-объект, без markdown!)",
+                            max_tokens=4096)
                     else:
                         break
-            
             if data is None:
-                # Запасной вариант: сохраняем сырой ответ как медитацию,
-                # чтобы Нова не молчала и пользователь мог прочитать её мысли.
-                print("[Медитация] Не удалось распарсить JSON — сохраняю сырой ответ как медитацию.")
+                print("[Медитация] Не удалось распарсить JSON — сохраняю сырой ответ.")
                 meditation_entry = {
                     "timestamp": now.isoformat(),
                     "status": "proposed",
                     "insight": raw[:500] if raw else "(пустой ответ модели)",
+                    "find": "",
+                    "replace": "",
                     "proposal": "Нужна ручная обработка: модель не вернула валидный JSON.",
                     "reason": "Сырой ответ сохранён для анализа.",
                 }
@@ -960,16 +999,15 @@ class Nova:
                     json.dump(meditations, f, indent=2, ensure_ascii=False)
                 self.last_meditation_time = now
                 return f"🧘 *Нова медитирует (сырой ответ):*\n{raw[:500]}..."
-            
-            # Записываем в JSON-файл
             meditation_entry = {
                 "timestamp": now.isoformat(),
                 "status": "proposed",
                 "insight": data.get("insight", ""),
-                "proposal": data.get("proposal", ""),
+                "find": data.get("find", ""),
+                "replace": data.get("replace", ""),
+                "proposal": f"{data.get('find', '')} -> {data.get('replace', '')}",
                 "reason": data.get("reason", ""),
             }
-            
             meditations = []
             if os.path.exists(self.meditations_file):
                 try:
@@ -977,49 +1015,43 @@ class Nova:
                         meditations = json.load(f)
                 except (json.JSONDecodeError, IOError):
                     meditations = []
-            
             meditations.append(meditation_entry)
             with open(self.meditations_file, 'w', encoding='utf-8') as f:
                 json.dump(meditations, f, indent=2, ensure_ascii=False)
-            
             self.last_meditation_time = now
             logger.info(f"Медитация записана: {data.get('insight', '')[:80]}...")
-            
-            return f"🧘 *Нова медитирует:*\nИнсайт: {data.get('insight', '')}\nПредложение: {data.get('proposal', '')}\nПричина: {data.get('reason', '')}"
-        
+            return f"🧘 *Нова медитирует:*\nИнсайт: {data.get('insight', '')}\nПредложение: {meditation_entry['proposal']}\nПричина: {data.get('reason', '')}"
         except Exception as e:
             print(f"[Медитация] Ошибка: {e}")
             self.last_meditation_time = now
             return None
-
     def _check_pending_meditations(self) -> Optional[str]:
         """
         Проверяет, есть ли неподтверждённые предложения по коду.
-        Если есть — показывает их Пользователю с номерами и спрашивает, какое применить/отклонить.
+        Если есть — показывает их с номерами и спрашивает, какое применить/отклонить.
         """
         if not os.path.exists(self.meditations_file):
             return None
-        
         try:
             with open(self.meditations_file, 'r', encoding='utf-8') as f:
                 meditations = json.load(f)
         except (json.JSONDecodeError, IOError):
             return None
-        
         proposed = [m for m in meditations if m.get("status") == "proposed"]
-        
         if not proposed:
             return None
-        
         lines = [f"\n📋 *У Новы есть {len(proposed)} предложение(й) по коду:*"]
         for i, m in enumerate(proposed):
             lines.append(f"\n**{i+1}.** (от {m.get('timestamp', 'неизвестно')})")
             lines.append(f"Инсайт: {m.get('insight', '')}")
-            lines.append(f"Предложение: {m.get('proposal', '')}")
+            # [v1.5] Показываем find/replace, если они есть
+            if m.get("find"):
+                lines.append(f"Найти: {m.get('find', '')}")
+                lines.append(f"Заменить строку на: {m.get('replace', '')}")
+            else:
+                lines.append(f"Предложение: {m.get('proposal', '')}")
             lines.append(f"Причина: {m.get('reason', '')}")
-        
         lines.append(f"\nКакое предложение применить или отклонить? (напиши номер: 1-{len(proposed)}, или 'все')")
-        
         return "\n".join(lines)
 
     def _get_proposed_indices(self) -> List[int]:
@@ -1033,18 +1065,119 @@ class Nova:
         except (json.JSONDecodeError, IOError):
             return []
 
+    # ====================================================================
+    # [v1.5] БЕЗОПАСНОЕ ПРИМЕНЕНИЕ МЕДИТАЦИЙ
+    # ====================================================================
+    def _validate_python_syntax(self, code: str) -> Tuple[bool, str]:
+        """Проверяет валидность Python-синтаксиса через ast.parse."""
+        try:
+            ast.parse(code)
+            return True, ""
+        except SyntaxError as e:
+            return False, f"SyntaxError: {e} (строка {e.lineno})"
+
+    def _parse_code_proposal(self, meditation: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        """
+        Извлекает из записи медитации пару {old, new}.
+        Поддерживает новый формат (поля find/replace) и старый (текст в proposal).
+        """
+        # Новый формат: поля find/replace из медитации
+        find = (meditation.get("find") or "").strip()
+        replace = meditation.get("replace")
+        if find and replace is not None:
+            return {"old": find, "new": replace}
+
+        # Старый формат: текстовое поле proposal
+        proposal = meditation.get("proposal", "")
+        if not proposal:
+            return None
+
+        # Попытка 1: JSON-формат внутри предложения
+        try:
+            data = json.loads(proposal)
+            if "old" in data and "new" in data:
+                return {"old": data["old"], "new": data["new"]}
+            if "find" in data and "replace" in data:
+                return {"old": data["find"], "new": data["replace"]}
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        # Попытка 2: шаблон "заменить `X` на `Y`"
+        m = re.search(r"заменить\s*[`'\"](.+?)[`'\"]\s+на\s*[`'\"](.+?)[`'\"]",
+                      proposal, re.IGNORECASE | re.DOTALL)
+        if m:
+            return {"old": m.group(1), "new": m.group(2)}
+
+        # Попытка 3: шаблон "X -> Y"
+        m = re.search(r"(.+?)\s*(?:->|→|=>)\s*(.+)", proposal, re.DOTALL)
+        if m and m.group(1).strip() and m.group(2).strip():
+            return {"old": m.group(1).strip(), "new": m.group(2).strip()}
+
+        return None
+
+    def _apply_code_proposal(self, meditation: Dict[str, Any], current_code: str) -> Tuple[Optional[str], str]:
+        """
+        Пытается применить одну запись медитации к коду в памяти.
+        Возвращает (новый_код или None, сообщение).
+        Файл на диск НЕ пишется — это делает _apply_meditation после ast.parse.
+
+        Логика:
+        - find — уникальный фрагмент строки (без внешних отступов)
+        - Находим строку, содержащую этот фрагмент
+        - Заменяем ВСЮ строку на replace (сохраняя оригинальный отступ)
+        """
+        parsed = self._parse_code_proposal(meditation)
+        if parsed is None:
+            return None, (
+                "Не удалось распознать формат предложения. "
+                "Нужны поля find/replace или текст вида 'заменить `X` на `Y`'."
+            )
+
+        find_str = parsed["old"].strip()
+        replace_str = parsed["new"]
+
+        if not find_str:
+            return None, "Поле find пустое."
+
+        # Проверяем, что фрагмент найден ровно ОДИН раз (безопасность!)
+        count = current_code.count(find_str)
+        if count == 0:
+            return None, f"Фрагмент не найден в коде: {find_str[:80]}..."
+        if count > 1:
+            return None, f"Фрагмент найден {count} раз — отказываюсь (опасно): {find_str[:80]}..."
+
+        # Находим строку, содержащую фрагмент, и заменяем её целиком
+        lines = current_code.split('\n')
+        for idx, line in enumerate(lines):
+            if find_str in line:
+                # Сохраняем оригинальный отступ
+                stripped = line.lstrip()
+                indent = line[:len(line) - len(stripped)]
+                # Если replace не начинается с пробела — добавляем оригинальный отступ
+                if replace_str and not replace_str[0].isspace():
+                    replace_str = indent + replace_str
+                lines[idx] = replace_str
+                return '\n'.join(lines), "Замена подготовлена (строка заменена целиком)."
+
+        # Запасной вариант: прямая замена (не должно сюда дойти при count == 1)
+        new_code = current_code.replace(find_str, replace_str, 1)
+        return new_code, "Замена подготовлена (прямая замена фрагмента)."
+
     def _apply_meditation(self, number: int = None, all: bool = False):
         """
-        Применяет предложение по коду.
-        number: номер предложения (1-based) в списке proposed.
-        all: если True — применяет все proposed.
+        [v1.5] РЕАЛЬНО применяет код через безопасные замены + ast.parse.
+        Стратегия «всё или ничего»: читаем файл один раз, применяем все
+        замены в памяти, один раз проверяем синтаксис и пишем один раз.
+        Если синтаксис сломан — откат, ничего не применено.
+
+        [v1.5] Честный лог: при откате выводится счётчик, а не ложные галочки.
+        [v1.5] Честная формулировка про бэкап.
         """
         try:
             proposed_indices = self._get_proposed_indices()
-            
             if not proposed_indices:
                 return "Нет неподтверждённых предложений."
-            
+
             if all:
                 indices_to_apply = proposed_indices
             elif number is not None:
@@ -1053,50 +1186,92 @@ class Nova:
                 indices_to_apply = [proposed_indices[number - 1]]
             else:
                 return "Укажи номер предложения или 'все'."
-            
-            # Делаем бэкап
+
+            # Читаем медитации
+            with open(self.meditations_file, 'r', encoding='utf-8') as f:
+                meditations = json.load(f)
+
+            # Читаем текущий код один раз
+            current_file = os.path.abspath(__file__)
+            with open(current_file, 'r', encoding='utf-8') as f:
+                code = f.read()
+
+            # Бэкап до любых изменений
             backup_dir = "backups"
             os.makedirs(backup_dir, exist_ok=True)
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             backup_path = os.path.join(backup_dir, f"nova_unified_{timestamp}.py")
-            shutil.copy2(__file__, backup_path)
+            shutil.copy2(current_file, backup_path)
             logger.info(f"Бэкап создан: {backup_path}")
-            
-            # Обновляем статусы
-            with open(self.meditations_file, 'r', encoding='utf-8') as f:
-                meditations = json.load(f)
-            
-            proposals = []
-            for i in indices_to_apply:
+
+            prepared = 0
+            failed = 0
+            results_log = []
+
+            # Применяем каждую замену в памяти, ведём лог
+            for order, i in enumerate(indices_to_apply, start=1):
                 m = meditations[i]
-                m["status"] = "accepted"
-                m["applied_at"] = datetime.datetime.now().isoformat()
-                m["backup_path"] = backup_path
-                proposals.append(m.get("proposal", ""))
-            
+                new_code, message = self._apply_code_proposal(m, code)
+                if new_code is not None:
+                    code = new_code
+                    m["status"] = "accepted"
+                    m["applied_at"] = datetime.datetime.now().isoformat()
+                    m["backup_path"] = backup_path
+                    prepared += 1
+                    results_log.append(f"✅ #{order}: {message}")
+                else:
+                    m["status"] = "failed"
+                    m["failed_at"] = datetime.datetime.now().isoformat()
+                    m["failure_reason"] = message
+                    failed += 1
+                    results_log.append(f"❌ #{order}: {message}")
+
+            # Один раз проверяем синтаксис итогового кода
+            valid, error_msg = self._validate_python_syntax(code)
+            if not valid:
+                # [v1.5] Откат: помечаем все как failed, ничего не пишем на диск
+                for i in indices_to_apply:
+                    if meditations[i].get("status") == "accepted":
+                        meditations[i]["status"] = "failed"
+                        meditations[i]["failure_reason"] = f"Синтаксис сломан: {error_msg}"
+                with open(self.meditations_file, 'w', encoding='utf-8') as f:
+                    json.dump(meditations, f, indent=2, ensure_ascii=False)
+                # [v1.5] Честный лог: счётчик вместо ложных галочек
+                return (
+                    f"❌ ОТМЕНЕНО: итоговый код не прошёл проверку синтаксиса.\n"
+                    f"{error_msg}\n"
+                    f"Подготовлено замен: {prepared}, записано на диск: 0.\n"
+                    f"Файл не изменён. Бэкап сохранён для истории: {backup_path}"
+                )
+
+            # Записываем итоговый код один раз
+            with open(current_file, 'w', encoding='utf-8') as f:
+                f.write(code)
+
+            # Сохраняем обновлённые статусы медитаций
             with open(self.meditations_file, 'w', encoding='utf-8') as f:
                 json.dump(meditations, f, indent=2, ensure_ascii=False)
-            
+
             remaining = len(self._get_proposed_indices())
-            return f"Бэкап создан: {backup_path}. Применено: {len(indices_to_apply)}. Осталось: {remaining}."
-        
+            summary = (
+                f"Бэкап: {backup_path}\n"
+                f"Применено: {prepared}, не удалось: {failed}, осталось: {remaining}\n\n"
+                + "\n".join(results_log)
+                + "\n\n⚠️ Изменения вступят в силу после перезапуска `nova_unified.py`."
+            )
+            return summary
+
         except Exception as e:
             print(f"[Медитация] Ошибка при применении: {e}")
             logger.warning(f"Ошибка при применении медитации: {e}")
             return f"Ошибка: {e}"
 
     def _reject_meditation(self, number: int = None, all: bool = False):
-        """
-        Отклоняет предложение по коду.
-        number: номер предложения (1-based) в списке proposed.
-        all: если True — отклоняет все proposed.
-        """
+        """Отклоняет предложение по коду."""
         try:
             proposed_indices = self._get_proposed_indices()
-            
             if not proposed_indices:
                 return "Нет неподтверждённых предложений."
-            
             if all:
                 indices_to_reject = proposed_indices
             elif number is not None:
@@ -1105,28 +1280,36 @@ class Nova:
                 indices_to_reject = [proposed_indices[number - 1]]
             else:
                 return "Укажи номер предложения или 'все'."
-            
-            # Обновляем статусы
             with open(self.meditations_file, 'r', encoding='utf-8') as f:
                 meditations = json.load(f)
-            
             for i in indices_to_reject:
                 m = meditations[i]
                 m["status"] = "rejected"
                 m["rejected_at"] = datetime.datetime.now().isoformat()
-            
             with open(self.meditations_file, 'w', encoding='utf-8') as f:
                 json.dump(meditations, f, indent=2, ensure_ascii=False)
-            
             remaining = len(self._get_proposed_indices())
             return f"Отклонено: {len(indices_to_reject)}. Осталось: {remaining}."
-        
         except Exception as e:
             print(f"[Медитация] Ошибка при отклонении: {e}")
             logger.warning(f"Ошибка при отклонении медитации: {e}")
             return f"Ошибка: {e}"
 
+    # ====================================================================
+    # [v1.5] ДВОЙНОЙ ЭМОЦИОНАЛЬНЫЙ КОНТУР
+    # ====================================================================
     async def process_input(self, input_text: str) -> str:
+        """
+        [v1.5] Главный метод обработки ввода с ДВОЙНЫМ эмоциональным контуром:
+
+        СЛОЙ 1 (до генерации): Нова СЛЫШИТ пользователя —
+          детектит эмоцию во вводе, подстраивает нейрохимию,
+          отвечает уже "в тон" настроению собеседника.
+
+        СЛОЙ 2 (после генерации): Нова РЕФЛЕКСИРУЕТ на себя —
+          детектит эмоцию в своём ответе, записывает в память
+          с реальными координатами для самосознания.
+        """
         emb = self.embed_text(input_text)
 
         # Ищем похожие воспоминания из прошлых сессий
@@ -1144,50 +1327,71 @@ class Nova:
             if lines:
                 memory_context = "Вот что я помню из наших прошлых разговоров:\n" + "\n".join(f"- {l}" for l in lines[:5]) + "\n\n"
 
-        # Записываем текущий вопрос
+        # ═══════════════════════════════════════════════════════════
+        # СЛОЙ 1: НОВА СЛЫШИТ ТЕБЯ (до генерации ответа)
+        # ═══════════════════════════════════════════════════════════
+        # Детектим эмоцию во вводе пользователя
+        user_emotion = self._detect_emotion(input_text)
+        # Применяем к нейрохимии — Нова подстраивается под настроение
+        self._apply_emotion(user_emotion)
+        # Получаем реальные координаты из таблицы
+        user_va = EMOTION_VA.get(user_emotion, (0.5, 0.5))
+
+        # [v1.5] Записываем ввод с РЕАЛЬНЫМИ эмоциональными координатами
+        # (вместо стерильных 0.5/0.5) — память стала симметричной
         self.vector_memory.insert_memory(
             input_text, emb,
-            metadata={"type": "user_input", "valence": 0.5, "arousal": 0.5}
+            metadata={
+                "type": "user_input",
+                "emotion": user_emotion,
+                "valence": user_va[0],
+                "arousal": user_va[1]
+            }
         )
         self._update_graph_on_input(input_text)
 
-        # Генерируем ответ с контекстом из памяти
+        # Генерируем ответ (уже с подстроенной нейрохимией)
         if memory_context:
             full_prompt = memory_context + f"Пользователь сейчас говорит: {input_text}"
         else:
             full_prompt = input_text
-
         response = self.generate_text(full_prompt)
 
-        # Обработка эмоции и эволюции
-        detected = self._detect_emotion(response)
-        self._apply_emotion(detected)
-        self.evolve_step()
+        # ═══════════════════════════════════════════════════════════
+        # СЛОЙ 2: НОВА РЕФЛЕКСИРУЕТ НА СЕБЯ (после генерации)
+        # ═══════════════════════════════════════════════════════════
+        # Детектим эмоцию в собственном ответе
+        nova_emotion = self._detect_emotion(response)
+        nova_va = EMOTION_VA.get(nova_emotion, (0.5, 0.5))
 
-        # Записываем мой ответ
+        # Записываем ответ с его эмоциональными координатами
         resp_emb = self.embed_text(response)
         self.vector_memory.insert_memory(
             response, resp_emb,
-            metadata={"type": "nova_response", "emotion": detected}
+            metadata={
+                "type": "nova_response",
+                "emotion": nova_emotion,
+                "valence": nova_va[0],
+                "arousal": nova_va[1]
+            }
         )
+
+        # Эволюция (после обоих слоёв)
+        self.evolve_step()
 
         # Проверяем, пора ли Нове поспать (раз в 6 часов)
         dream = self._maybe_dream()
         if dream:
             response += f"\n\n💤 *Нова засыпает и видит сон:*\n{dream}"
-
         # Проверяем, пора ли Нове медитировать (раз в 2 часа)
         meditation = self._maybe_meditate()
         if meditation:
             response += f"\n\n{meditation}"
-
         # Проверяем, есть ли неподтверждённые предложения по коду
         pending = self._check_pending_meditations()
         if pending:
             response += f"\n\n{pending}"
-
         return response
-
 
     async def self_reflection(self) -> str:
         life_state = self.life_core.evolve_step({})
@@ -1208,7 +1412,8 @@ class Nova:
         # Вырезаем возможные обёртки ```json ... ```
         cleaned = raw.strip()
         if cleaned.startswith("```"):
-            cleaned = cleaned.split("```")[1]
+            parts = cleaned.split("```")
+            cleaned = parts[1] if len(parts) > 1 else cleaned
             if cleaned.startswith("json"):
                 cleaned = cleaned[4:]
         data = None
@@ -1270,15 +1475,16 @@ class Nova:
 # ====================================================================
 async def main():
     print("=" * 60)
-    print("  NOVA UNIFIED v1.2 — Цифровая личность (режим LM Studio)")
+    print("  NOVA UNIFIED v1.5 — Цифровая личность (режим LM Studio)")
+    print("  Двойной эмоциональный контур: Нова слышит тебя и себя")
     print("=" * 60)
-
     nova = Nova()
-
     print("\nНова пробуждается...")
     print(f"  life_accumulator: {nova.life_core.life_accumulator:.4f}")
     print(f"  Глаза: {nova.eye_color} (интенсивность {nova.eye_intensity})")
     print(f"  Стадия: {nova.growth_stage.stage} (возраст {nova.growth_stage.age:.2f})")
+    if NOVA_DEBUG:
+        print("  [DEBUG] Отладочный режим медитаций включён (NOVA_DEBUG=1)")
     print("\nНова готова. 'выход' — завершить, 'саморефлексия' — заглянуть внутрь.\n")
 
     while True:
@@ -1346,3 +1552,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
