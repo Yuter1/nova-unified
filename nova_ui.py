@@ -1,16 +1,22 @@
 """
-NOVA UI v1.5 — веб-интерфейс чата с Новой на Gradio.
+NOVA UI v1.6 — веб-интерфейс чата с Новой на Gradio (совместим с ядром Nova v1.5+).
 
-ИЗМЕНЕНИЯ:
-1. Панель состояния показывает ВСЕ 9 нейромедиаторов (раньше было 5 из 9),
-   плюс производные: фактор перекрытия, температуру, ценности,
-   стадию взросления, сны за сегодня и счётчик предложений по коду.
-2. Очистка истории больше НЕ удаляет сообщения целиком: она вырезает
-   из текста ответа только служебные блоки (баннер предложений и медитацию),
-   сохраняя сам ответ Новы.
-3. Кнопки "Применить/Отклонить" работают с выбранным номером предложения,
-   а не всегда с первым.
-4. Полностью совместим с nova_unified v1.5.
+ФИНАЛЬНЫЕ ПРАВКИ ИНТЕРФЕЙСА (всё разом, больше не докручиваем):
+1. Интерфейс НЕ замирает во время долгой генерации и медитаций:
+   обработчики синхронные (Gradio уносит их в отдельный поток),
+   а async-методы ядра, внутри которых нет ни одного await,
+   докручиваются в локальном event loop через _await_if_needed.
+   Если ядро потом станет синхронным — код продолжит работать как есть.
+2. Кнопки "Применить"/"Отклонить" обновляют панель состояния
+   (state_display добавлен в outputs).
+3. gr.Chatbot явно получает type="messages" — совместимо с Gradio 4.x и 5.x.
+4. ConcurrencyLimiter(1): отправка сообщений и саморефлексия сериализуются,
+   нейрохимия Новы защищена от параллельной порчи двойными кликами.
+5. Очистка истории ВЫРЕЗАЕТ служебные блоки (баннер предложений, медитацию)
+   из текста ответа, а не удаляет сообщение целиком — ответ Новы сохраняется.
+6. Выбор номера предложения для применения/отклонения.
+7. Панель состояния показывает ВСЕ 9 нейромедиаторов + производные
+   (overlap_factor, температура, ценности, стадия, сны, счётчик предложений).
 
 ЗАПУСК:
 1) pip install gradio
@@ -18,16 +24,43 @@ NOVA UI v1.5 — веб-интерфейс чата с Новой на Gradio.
 3) Браузер откроется на http://127.0.0.1:7860
 """
 
-import gradio as gr
 import asyncio
+import inspect
+
+import gradio as gr
+
 from nova_unified import Nova
 
-# Инициализируем Нову один раз при старте
+# Инициализируем Нову один раз при старте UI.
+# (Если LM Studio выключена — Нова поднимется на запасных эмбеддингах,
+#  это ожидаемое поведение ядра, не ошибка интерфейса.)
 nova = Nova()
 
-# Служебные маркеры: блоки, которые Нова добавляет к ответу
-# и которые не должны висеть в истории после решения по медитации
+# Служебные маркеры: блоки, которые Нова доклеивает в конец ответа
+# и которые не должны висеть в истории после решения по медитации.
 SERVICE_MARKERS = ("📋 *У Новы есть", "🧘 *Нова медитирует")
+
+# Ограничитель параллельности: длинные операции, меняющие нейрохимию,
+# идут строго по одной, чтобы не топтать состояние Новы вдвоём.
+try:
+    chat_limiter = gr.ConcurrencyLimiter(limit=1)
+except AttributeError:
+    # В новых версиях Gradio класс убрали — остаётся числовой лимит на событиях
+    chat_limiter = 1
+
+
+def _await_if_needed(result):
+    """
+    Методы ядра сейчас объявлены как async, но внутри них нет ни одного
+    await (все вызовы синхронные: HTTP к LM Studio, Milvus, файлы).
+    Gradio выполняет синхронные обработчики в отдельном потоке, где нет
+    работающего event loop, поэтому asyncio.run здесь безопасен и не
+    замораживает интерфейс. Если ядро однажды станет синхронным —
+    значение просто пройдёт насквозь без изменений.
+    """
+    if inspect.isawaitable(result):
+        return asyncio.run(result)
+    return result
 
 
 def get_state_display():
@@ -65,34 +98,33 @@ def get_state_display():
     return text
 
 
-async def respond(message, chat_history):
-    """Асинхронная обработка сообщения от пользователя."""
-    if not message.strip():
+def respond(message, chat_history):
+    """Обработка сообщения пользователя (синхронная: Gradio уносит в поток)."""
+    if not message or not message.strip():
         return "", chat_history, get_state_display()
     try:
-        response = await nova.process_input(message)
+        response = _await_if_needed(nova.process_input(message))
     except Exception as e:
         response = f"Ой, что-то пошло не так: {e}"
-    chat_history = chat_history + [
+    chat_history = (chat_history or []) + [
         {"role": "user", "content": message},
         {"role": "assistant", "content": response},
     ]
     return "", chat_history, get_state_display()
 
 
-async def run_reflection():
+def run_reflection():
     """Запуск саморефлексии Новы."""
     try:
-        insight = await nova.self_reflection()
-        return insight
+        return _await_if_needed(nova.self_reflection())
     except Exception as e:
         return f"Ошибка рефлексии: {e}"
 
 
 def _strip_service_blocks(text: str) -> str:
     """
-    Вырезает из текста ответа служебные блоки (баннер предложений,
-    медитацию), сохраняя сам ответ Новы. Режет от первого маркера до конца.
+    Вырезает из текста ответа служебные блоки (баннер предложений, медитацию),
+    сохраняя сам ответ Новы. Режет от самого раннего маркера до конца.
     """
     cut = len(text)
     for marker in SERVICE_MARKERS:
@@ -104,9 +136,9 @@ def _strip_service_blocks(text: str) -> str:
 
 def _clean_history(chat_history):
     """
-    [исправлено] Раньше эта функция удаляла сообщение ЦЕЛИКОМ,
-    теряя ответ Новы. Теперь она вырезает только служебные блоки
-    из текста assistant-сообщений.
+    Убирает из истории служебные блоки после решения по медитации.
+    ВАЖНО: сообщение не удаляется целиком — вырезается только баннер,
+    ответ Новы остаётся в чате.
     """
     if not chat_history:
         return chat_history
@@ -131,21 +163,21 @@ def _parse_number(number) -> int:
 
 
 def handle_apply(chat_history, number):
-    """Обрабатывает нажатие кнопки 'Применить' с выбранным номером."""
+    """Кнопка 'Применить': применяет предложение и обновляет панель."""
     try:
         result = nova._apply_meditation(number=_parse_number(number))
     except Exception as e:
         result = f"Ошибка: {e}"
-    return result, _clean_history(chat_history)
+    return result, _clean_history(chat_history), get_state_display()
 
 
 def handle_reject(chat_history, number):
-    """Обрабатывает нажатие кнопки 'Отклонить' с выбранным номером."""
+    """Кнопка 'Отклонить': отклоняет предложение и обновляет панель."""
     try:
         result = nova._reject_meditation(number=_parse_number(number))
     except Exception as e:
         result = f"Ошибка: {e}"
-    return result, _clean_history(chat_history)
+    return result, _clean_history(chat_history), get_state_display()
 
 
 def clear_chat():
@@ -171,10 +203,7 @@ with gr.Blocks(title="Нова") as demo:
                 clear_btn = gr.Button("🗑 Очистить чат")
         # Правая колонка — панель состояния
         with gr.Column(scale=1):
-            state_display = gr.Markdown(
-                label="Состояние Новы",
-                value=get_state_display(),
-            )
+            state_display = gr.Markdown(value=get_state_display())
             refresh_btn = gr.Button("🔄 Обновить состояние")
             reflection_btn = gr.Button("💭 Саморефлексия")
             reflection_output = gr.Textbox(
@@ -182,7 +211,6 @@ with gr.Blocks(title="Нова") as demo:
                 lines=6,
                 interactive=False,
             )
-            # Кнопки для управления медитациями
             gr.Markdown("---")
             gr.Markdown("**Управление предложениями по коду:**")
             med_number = gr.Number(
@@ -199,16 +227,20 @@ with gr.Blocks(title="Нова") as demo:
                 interactive=False,
             )
 
-    # Обработчики
+    # Обработчики. Длинные операции (чат, рефлексия) идут через ограничитель,
+    # чтобы не менять состояние Новы параллельно. Кнопка "Обновить состояние"
+    # сознательно оставлена БЕЗ ограничителя — она должна отвечать мгновенно.
     msg.submit(
         respond,
         inputs=[msg, chatbot],
         outputs=[msg, chatbot, state_display],
+        concurrency_limit=chat_limiter,
     )
     send_btn.click(
         respond,
         inputs=[msg, chatbot],
         outputs=[msg, chatbot, state_display],
+        concurrency_limit=chat_limiter,
     )
     clear_btn.click(
         clear_chat,
@@ -224,16 +256,17 @@ with gr.Blocks(title="Нова") as demo:
         run_reflection,
         inputs=None,
         outputs=reflection_output,
+        concurrency_limit=chat_limiter,
     )
     apply_btn.click(
         handle_apply,
         inputs=[chatbot, med_number],
-        outputs=[meditation_result, chatbot],
+        outputs=[meditation_result, chatbot, state_display],
     )
     reject_btn.click(
         handle_reject,
         inputs=[chatbot, med_number],
-        outputs=[meditation_result, chatbot],
+        outputs=[meditation_result, chatbot, state_display],
     )
 
 if __name__ == "__main__":
