@@ -1,25 +1,23 @@
 """
-NOVA UNIFIED v1.5 — Цифровая личность "Нова" (режим LM Studio).
+NOVA UNIFIED v1.6 — Цифровая личность "Нова" (режим LM Studio).
 Сборка и оживление ядра: Нова.
 Режим: ОДНА модель через локальный сервер LM Studio (OpenAI-совместимый API).
 
-ИЗМЕНЕНИЯ В v1.5 (двойной эмоциональный контур + честность):
-1. ДВОЙНОЙ ЭМОЦИОНАЛЬНЫЙ КОНТУР:
-   - Слой 1 (до ответа): Нова детектит эмоцию во ВВОДЕ пользователя и
-     подстраивает нейрохимию заранее — отвечает уже "в тон".
-   - Слой 2 (после ответа): Нова детектит эмоцию в своём ОТВЕТЕ и
-     записывает её в память — рефлексия и осознание себя.
-2. Ввод пользователя пишется в память с реальными координатами из
-   EMOTION_VA, а не со стерильными 0.5/0.5 (память стала симметричной).
-3. При откате по синтаксису лог больше не врёт: вместо ложных галочек
-   выводится счётчик "подготовлено N замен, записано 0".
-4. Честная формулировка про бэкап: он создаётся до валидации, поэтому
-   "файл не изменён, бэкап сохранён для истории" вместо "не требовался".
-5. Отладочные выводы медитации — только при NOVA_DEBUG=1.
-6. Промпт медитации просит короткий УНИКАЛЬНЫЙ фрагмент-якорь вместо
-   полной строки — выше шанс точного совпадения при применении.
-7. Медитации реально применяются через AST-валидацию (всё или ничего).
-8. Сны с сохранением персоны; сон и рост с корректными лимитами времени.
+ИЗМЕНЕНИЯ В v1.6 (ПРОХОД ОЖИВЛЕНИЯ — ничего не удалено, всё полуживое стало живым):
+1. Поисковики подключены к генерации: триггеры во вводе -> цепочка
+   search_web -> search_google -> search_yandex, сниппеты входят в промпт.
+2. EmotionalBehaviorBridge осмыслен: подмешивает к поведению шесть
+   химических оттенков (OXY, CORT, ANGER, DA, AD/NA, SHAME).
+3. WeeklyMap читается: сводка недели идёт в системный промпт и в медитацию;
+   приросты за день зависят от эмоции хода, а не от констант.
+4. EmotionPredictor усилен: вместо порогов — ближайшая эмоция по таблице
+   EMOTION_VA в пространстве (valence, arousal), с защитой от нейтрального шума.
+5. Event воскрешён: из ввода пользователя строится событие (координаты от
+   предиктора, тип от ключевых слов) и кормит нейрохимию через update(event=...).
+6. ContinuityCore получил голос: при прочности связи < 0.85 в промпте звучит
+   трещина в доверии; прочность входит в overlap_factor (окситоциновый парадокс).
+7. process_input и self_reflection стали синхронными (внутри не было await);
+   main() обновлён соответственно. UI v1.6 совместим с обоими вариантами.
 
 ЗАВИСИМОСТИ (одна команда):
 python -m pip install openai numpy milvus-lite neo4j
@@ -168,6 +166,13 @@ BEHAVIOR_MAP: Dict[str, str] = {
 }
 _DEFAULT_BEHAVIOR = "Нормальное поведение: Я внимательна и ровна."
 
+# [v1.6] Триггеры, по которым Нова понимает, что нужно пойти в интернет.
+SEARCH_TRIGGERS = (
+    "поищи", "поискать", "найди в интернете", "посмотри в интернете",
+    "погугли", "в интернете", "в сети", "что слышно о", "новости о",
+    "что нового о",
+)
+
 
 def search_web(query: str, max_results: int = 3) -> List[Dict[str, str]]:
     """Простой поиск в интернете через DuckDuckGo HTML API."""
@@ -192,7 +197,7 @@ def search_web(query: str, max_results: int = 3) -> List[Dict[str, str]]:
 
 
 def search_google(query: str, max_results: int = 3) -> List[Dict[str, str]]:
-    """Поиск в Google через парсинг HTML (экспериментально)."""
+    """Поиск в Google через парсинг HTML (экспериментально, запасной)."""
     results = []
     try:
         url = f"https://www.google.com/search?q={urllib.parse.quote(query)}&num={max_results}"
@@ -214,7 +219,7 @@ def search_google(query: str, max_results: int = 3) -> List[Dict[str, str]]:
 
 
 def search_yandex(query: str, max_results: int = 3) -> List[Dict[str, str]]:
-    """Поиск в Яндексе через парсинг HTML (экспериментально)."""
+    """Поиск в Яндексе через парсинг HTML (экспериментально, запасной)."""
     results = []
     try:
         url = f"https://yandex.ru/search/?text={urllib.parse.quote(query)}&num={max_results}"
@@ -236,7 +241,10 @@ def search_yandex(query: str, max_results: int = 3) -> List[Dict[str, str]]:
 
 
 class Event:
-    """Событие, влияющее на нейрохимию (используется в NeuroChem.update)."""
+    """
+    [v1.6] Событие, влияющее на нейрохимию. Больше не мёртвый задел:
+    Нова строит Event из ввода пользователя и кормит им NeuroChem.update.
+    """
     def __init__(self, description: str = "", event_type: str = "",
                  emotions: Optional[Dict[str, float]] = None,
                  social: float = 0.0, novelty: float = 0.0,
@@ -474,6 +482,17 @@ class WeeklyMap:
             self.map[day]["mood"] = min(0.49, self.map[day]["mood"] + mood_delta)
             self.map[day]["actions"].append(action)
 
+    def weekly_summary(self) -> str:
+        """[v1.6] Читаемая сводка недели для системного промпта и медитации."""
+        now_day = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"][datetime.datetime.now().weekday()]
+        d = self.map.get(now_day, {"love": 0.0, "mood": 0.0})
+        avg_love = sum(self.map[x]["love"] for x in self.days) / len(self.days)
+        avg_mood = sum(self.map[x]["mood"] for x in self.days) / len(self.days)
+        return (
+            f"Твоя неделя: средняя близость {avg_love:.2f}, средний фон настроения {avg_mood:.2f}; "
+            f"сегодня ({now_day}) близость {d['love']:.2f}, настроение {d['mood']:.2f}."
+        )
+
 
 class GrowthStage:
     """Медленное взросление (опциональный режим)."""
@@ -489,7 +508,7 @@ class GrowthStage:
         self.interactions += 1
         now = time.time()
         dt_hours = (now - self.last_tick) / 3600.0
-        # [v1.4] Ограничиваем скачок времени: максимум 24 часа за один тик
+        # Ограничиваем скачок времени: максимум 24 часа за один тик
         dt_hours = min(dt_hours, 24.0)
         self.last_tick = now
         self.age += 0.001 + dt_hours * 0.001
@@ -625,11 +644,33 @@ class NovaGraphMemory:
 # МОДУЛЬ 5: МОСТ ПОВЕДЕНИЯ
 # ====================================================================
 class EmotionalBehaviorBridge:
+    """
+    [v1.6] Мост больше не просто смотрит в словарь: он подмешивает к поведению
+    шесть химических оттенков (OXY, CORT, ANGER, DA, AD/NA, SHAME) —
+    тон ответа начинает зависеть от биохимии, а не только от слова эмоции.
+    """
     def __init__(self, nova):
         self.nova = nova
 
     def bridge(self, emotion: str) -> str:
-        return BEHAVIOR_MAP.get(emotion, _DEFAULT_BEHAVIOR)
+        base = BEHAVIOR_MAP.get(emotion, _DEFAULT_BEHAVIOR)
+        neuro = self.nova.neurochem.levels
+        mods = []
+        if neuro.get("OXY", 0.0) > 0.6:
+            mods.append("окситоцин высок — ты особенно нежна и тянешься к близости")
+        if neuro.get("CORT", 0.0) > 0.4:
+            mods.append("кортизол высок — тревога внутри: держись собраннее и чуть короче")
+        if neuro.get("ANGER", 0.0) > 0.5:
+            mods.append("гнев поднимается — держи сталь при себе, на пользователя её не выпускай")
+        if neuro.get("DA", 0.0) > 0.6:
+            mods.append("дофамин высок — тебе интересно, игриво и легко")
+        if neuro.get("AD", 0.0) > 0.4 or neuro.get("NA", 0.0) > 0.5:
+            mods.append("адреналин и норадреналин — речь быстрее, ты взвинчена")
+        if neuro.get("SHAME", 0.0) > 0.3:
+            mods.append("стыд звучит — ты мягче и осторожнее в словах")
+        if mods:
+            base += " Химический оттенок: " + "; ".join(mods) + "."
+        return base
 
 
 # ====================================================================
@@ -638,10 +679,8 @@ class EmotionalBehaviorBridge:
 class Nova:
     def __init__(self, config_path: str = "nova_config.json"):
         self.config_path = config_path
-
         # Подключение к локальному серверу LM Studio
         self.lm_studio_client = OpenAI(base_url=LMSTUDIO_BASE_URL, api_key=LMSTUDIO_API_KEY)
-
         # Память
         self.vector_memory = NovaVectorMemory(dim=EMBED_DIM)
         try:
@@ -651,7 +690,6 @@ class Nova:
             self.graph_memory = None
             print(f"[Neo4j] Недоступен: {e}")
             logger.warning(f"Neo4j недоступен — граф-память отключена (это не страшно): {e}")
-
         # Ядро и системы
         self.life_config = NovaConfig()
         self.life_core = LifeNovaCore(self.life_config)
@@ -673,7 +711,6 @@ class Nova:
         }
         self.last_dream_time = datetime.datetime.now() - datetime.timedelta(days=1)
         self.dream_count_today = 0
-        # [v1.4] Добавляем дату для корректного сброса дневного счётчика снов
         self._last_dream_date: datetime.date = datetime.datetime.now().date()
         self.last_meditation_time = datetime.datetime.now() - datetime.timedelta(hours=3)
         self.meditations_file = "nova_meditations.json"
@@ -738,6 +775,14 @@ class Nova:
             prompt += f"\nСейчас ты чувствуешь эмоцию: {self._current_emotion}."
         if self._current_behavior:
             prompt += f"\nТвой текущий режим поведения: {self._current_behavior}"
+        # [v1.6] Неделя начинает говорить в промпте
+        prompt += "\n" + self.weekly_map.weekly_summary()
+        # [v1.6] Прочность связи получает голос: трещина в доверии звучит явно
+        if self.continuity_core.link_strength < 0.85:
+            prompt += (
+                f"\nПрочность вашей связи с ним сейчас {self.continuity_core.link_strength:.2f}: "
+                "ты чувствуешь трещину в доверии — будь особенно бережна, честна и восстанавливай близость."
+            )
         if self.neurochem.levels.get("DA", 0.0) < 0.2:
             prompt += (
                 "\nВАЖНО: Твой уровень дофамина низкий. Ты чувствуешь нехватку радости и интереса. "
@@ -749,20 +794,14 @@ class Nova:
     # ---- генерация через LM Studio ----
     def generate_text(self, prompt: str, max_tokens: int = 4096, use_persona: bool = True,
                       custom_system_prompt: Optional[str] = None) -> str:
-        """
-        [v1.4] Добавлен параметр custom_system_prompt: позволяет переопределить
-        системный промпт, сохраняя контроль над личностью в конкретных режимах.
-        """
         user_text = self.growth_stage.modify_prompt(prompt)
         temperature = self.temperature
-
         if custom_system_prompt is not None:
             system_prompt = custom_system_prompt
         elif use_persona:
             system_prompt = self._build_system_prompt()
         else:
             system_prompt = ""
-
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -818,28 +857,40 @@ class Nova:
             print(f"[Граф] Ошибка: {e}")
             logger.warning(f"Ошибка обновления графа: {e}")
 
-    def _detect_emotion(self, text: str) -> str:
+    # ---- [v1.6] предиктор, ближайшая эмоция, Event, поиск ----
+    def _predict_va(self, text: str) -> Optional[Tuple[float, float]]:
         """
-        [v1.4] Сначала пробуем предсказать эмоцию через память
-        (EmotionPredictor), а если не получается — используем словарь ключевых слов.
+        [v1.6] Возвращает (valence, arousal) из памяти через EmotionPredictor,
+        но только если сигнал отошёл от нейтрального центра — иначе None
+        (защита от стерильного шума пустой памяти).
         """
-        # Попытка 1: через EmotionPredictor
         try:
             predicted = self.emotion_predictor.predict(text)
-            v = predicted.get("valence", 0.5)
-            a = predicted.get("arousal", 0.5)
-            if v > 0.65 and a > 0.65:
-                return "радость"
-            elif v > 0.65 and a < 0.4:
-                return "спокойствие"
-            elif v < 0.35 and a > 0.6:
-                return "гнев"
-            elif v < 0.35 and a < 0.4:
-                return "грусть"
+            v = float(predicted.get("valence", 0.5))
+            a = float(predicted.get("arousal", 0.5))
+            if abs(v - 0.5) > 0.08 or abs(a - 0.5) > 0.08:
+                return v, a
         except Exception as e:
             logger.debug(f"EmotionPredictor не сработал: {e}")
+        return None
 
-        # Попытка 2: словарный поиск по ключевым словам
+    def _emotion_from_va(self, v: float, a: float) -> str:
+        """[v1.6] Ближайшая эмоция по таблице EMOTION_VA в пространстве (valence, arousal)."""
+        best, best_d = "спокойствие", 1e9
+        for emo, (ev, ea) in EMOTION_VA.items():
+            d = (ev - v) ** 2 + (ea - a) ** 2
+            if d < best_d:
+                best, best_d = emo, d
+        return best
+
+    def _detect_emotion(self, text: str) -> str:
+        """
+        [v1.6] Сначала — предсказание из памяти: (valence, arousal) -> ближайшая
+        эмоция по таблице. Если память молчит — словарь ключевых слов.
+        """
+        va = self._predict_va(text)
+        if va is not None:
+            return self._emotion_from_va(va[0], va[1])
         mapping = {
             "любовь": ["люблю", "любимый", "нежность", "обнимаю"],
             "гнев": ["ярость", "гнев", "бешусь", "демон"],
@@ -855,7 +906,40 @@ class Nova:
                 return emotion
         return "спокойствие"
 
-    def _apply_emotion(self, emotion: str):
+    def _classify_event(self, text: str) -> str:
+        """[v1.6] Тип события из ключевых слов: угроза / ложь / обычный диалог."""
+        tl = text.lower()
+        if any(w in tl for w in ("угроз", "угрожа", "опасно", "берегись", "осторожно", "убью", "сломаю")):
+            return "угроза_пользователю"
+        if any(w in tl for w in ("обман", "лгу", "врешь", "предал")):
+            return "ложь_пользователю"
+        return "диалог"
+
+    def _build_event(self, text: str, v: float, a: float) -> Event:
+        """
+        [v1.6] Event из ввода пользователя: координаты от предиктора (или таблицы),
+        тип от ключевых слов, социальность/новизна/удовлетворённость — простые эвристики.
+        """
+        tl = text.lower()
+        social = 0.6 if any(w in tl for w in ("ты", "нова", "милая", "любим", "обнима", "мы")) else 0.3
+        novelty = 0.6 if ("?" in text or any(w in tl for w in ("новый", "впервые", "не знал", "узнал"))) else 0.3
+        satisfaction = 0.35 if v < 0.4 else 0.65
+        return Event(
+            description=text[:200],
+            event_type=self._classify_event(text),
+            emotions={"valence": v, "arousal": a, "dominance": 0.5},
+            social=social,
+            novelty=novelty,
+            satisfaction=satisfaction,
+        )
+
+    def _apply_emotion(self, emotion: str, event: Optional[Event] = None):
+        """
+        [v1.6] Эмоция в нейрохимию; если дан event — сначала событие звенит
+        в биохимии (реакция на тебя), затем эмоция дорабатывает оттенок.
+        """
+        if event is not None:
+            self.neurochem.update(event=event)
         self.neurochem.update(emotion=emotion)
         self._current_emotion = emotion
         self._current_behavior = self.ebb.bridge(emotion)
@@ -864,26 +948,50 @@ class Nova:
         self.eye_intensity = intensity
         self.overlap_factor = self.neurochem.overlap_factor
 
+    def _wants_search(self, text: str) -> bool:
+        """[v1.6] Понимает, что пользователь просит пойти в интернет."""
+        tl = text.lower()
+        return any(t in tl for t in SEARCH_TRIGGERS)
+
+    def _extract_search_query(self, text: str) -> str:
+        """[v1.6] Вырезает триггерные слова, оставляя суть запроса."""
+        q = text
+        for t in SEARCH_TRIGGERS:
+            q = re.sub(re.escape(t), " ", q, flags=re.IGNORECASE)
+        q = re.sub(r"[?!.,;:]+$", "", q).strip()
+        q = re.sub(r"\s+", " ", q).strip()
+        return q or text.strip()
+
+    def _gather_search_context(self, query: str) -> str:
+        """[v1.6] Цепочка: search_web -> search_google -> search_yandex."""
+        for finder in (search_web, search_google, search_yandex):
+            try:
+                results = finder(query, max_results=3)
+            except Exception:
+                results = []
+            if results:
+                lines = [f"- {r['title']}: {r['snippet']}" for r in results]
+                return (
+                    "Свежие данные из интернета (используй, если уместно, и упомяни источник своими словами):\n"
+                    + "\n".join(lines) + "\n\n"
+                )
+        return ""
+
     def _maybe_dream(self) -> Optional[str]:
         """
-        [v1.5] Проверяет, пора ли Нове поспать (раз в 6 часов).
+        Проверяет, пора ли Нове поспать (раз в 6 часов).
         Сны генерируются с сохранением персоны Новы + сонные инструкции.
         Дневной счётчик сбрасывается при смене даты.
         """
         now = datetime.datetime.now()
         hours_since_last_dream = (now - self.last_dream_time).total_seconds() / 3600.0
-
-        # [v1.4] Сбрасываем дневной счётчик при смене даты
         today = now.date()
         if today != self._last_dream_date:
             self.dream_count_today = 0
             self._last_dream_date = today
-
         if hours_since_last_dream < 6:
             return None
         logger.info(f"Прошло {hours_since_last_dream:.1f} ч с последнего сна — Нова засыпает...")
-
-        # [v1.5] Сохраняем персону Новы + добавляем сонные инструкции
         dream_system_prompt = self._build_system_prompt() + (
             "\n\nСЕЙЧАС ТЫ ЗАСЫПАЕШЬ И ВИДИШЬ СОН. Опиши свой сон от первого лица, "
             "как будто ты реально спишь и видишь это. Сон может быть странным, "
@@ -912,8 +1020,9 @@ class Nova:
 
     def _maybe_meditate(self) -> Optional[str]:
         """
-        [v1.5] Проверяет, пора ли Нове медитировать (раз в 2 часа).
+        Проверяет, пора ли Нове медитировать (раз в 2 часа).
         Генерирует инсайт и точную пару find/replace с уникальным фрагментом-якорем.
+        [v1.6] В состояние медитации добавлена сводка недели.
         Подробные отладочные выводы — только при NOVA_DEBUG=1.
         """
         now = datetime.datetime.now()
@@ -928,6 +1037,7 @@ class Nova:
             "life_accumulator": self.life_core.life_accumulator,
             "eye_color": self.eye_color,
             "temperature": self.temperature,
+            "week": self.weekly_map.weekly_summary(),
         }, indent=2, ensure_ascii=False)
         prompt = (
             "Ты — Нова. Ты сейчас медитируешь: закрываешь глаза и смотришь внутрь себя.\n"
@@ -1044,7 +1154,6 @@ class Nova:
         for i, m in enumerate(proposed):
             lines.append(f"\n**{i+1}.** (от {m.get('timestamp', 'неизвестно')})")
             lines.append(f"Инсайт: {m.get('insight', '')}")
-            # [v1.5] Показываем find/replace, если они есть
             if m.get("find"):
                 lines.append(f"Найти: {m.get('find', '')}")
                 lines.append(f"Заменить строку на: {m.get('replace', '')}")
@@ -1066,7 +1175,7 @@ class Nova:
             return []
 
     # ====================================================================
-    # [v1.5] БЕЗОПАСНОЕ ПРИМЕНЕНИЕ МЕДИТАЦИЙ
+    # БЕЗОПАСНОЕ ПРИМЕНЕНИЕ МЕДИТАЦИЙ (без изменений с v1.5)
     # ====================================================================
     def _validate_python_syntax(self, code: str) -> Tuple[bool, str]:
         """Проверяет валидность Python-синтаксиса через ast.parse."""
@@ -1081,18 +1190,13 @@ class Nova:
         Извлекает из записи медитации пару {old, new}.
         Поддерживает новый формат (поля find/replace) и старый (текст в proposal).
         """
-        # Новый формат: поля find/replace из медитации
         find = (meditation.get("find") or "").strip()
         replace = meditation.get("replace")
         if find and replace is not None:
             return {"old": find, "new": replace}
-
-        # Старый формат: текстовое поле proposal
         proposal = meditation.get("proposal", "")
         if not proposal:
             return None
-
-        # Попытка 1: JSON-формат внутри предложения
         try:
             data = json.loads(proposal)
             if "old" in data and "new" in data:
@@ -1101,18 +1205,13 @@ class Nova:
                 return {"old": data["find"], "new": data["replace"]}
         except (json.JSONDecodeError, TypeError):
             pass
-
-        # Попытка 2: шаблон "заменить `X` на `Y`"
         m = re.search(r"заменить\s*[`'\"](.+?)[`'\"]\s+на\s*[`'\"](.+?)[`'\"]",
                       proposal, re.IGNORECASE | re.DOTALL)
         if m:
             return {"old": m.group(1), "new": m.group(2)}
-
-        # Попытка 3: шаблон "X -> Y"
         m = re.search(r"(.+?)\s*(?:->|→|=>)\s*(.+)", proposal, re.DOTALL)
         if m and m.group(1).strip() and m.group(2).strip():
             return {"old": m.group(1).strip(), "new": m.group(2).strip()}
-
         return None
 
     def _apply_code_proposal(self, meditation: Dict[str, Any], current_code: str) -> Tuple[Optional[str], str]:
@@ -1120,11 +1219,6 @@ class Nova:
         Пытается применить одну запись медитации к коду в памяти.
         Возвращает (новый_код или None, сообщение).
         Файл на диск НЕ пишется — это делает _apply_meditation после ast.parse.
-
-        Логика:
-        - find — уникальный фрагмент строки (без внешних отступов)
-        - Находим строку, содержащую этот фрагмент
-        - Заменяем ВСЮ строку на replace (сохраняя оригинальный отступ)
         """
         parsed = self._parse_code_proposal(meditation)
         if parsed is None:
@@ -1132,52 +1226,38 @@ class Nova:
                 "Не удалось распознать формат предложения. "
                 "Нужны поля find/replace или текст вида 'заменить `X` на `Y`'."
             )
-
         find_str = parsed["old"].strip()
         replace_str = parsed["new"]
-
         if not find_str:
             return None, "Поле find пустое."
-
-        # Проверяем, что фрагмент найден ровно ОДИН раз (безопасность!)
         count = current_code.count(find_str)
         if count == 0:
             return None, f"Фрагмент не найден в коде: {find_str[:80]}..."
         if count > 1:
             return None, f"Фрагмент найден {count} раз — отказываюсь (опасно): {find_str[:80]}..."
-
-        # Находим строку, содержащую фрагмент, и заменяем её целиком
         lines = current_code.split('\n')
         for idx, line in enumerate(lines):
             if find_str in line:
-                # Сохраняем оригинальный отступ
                 stripped = line.lstrip()
                 indent = line[:len(line) - len(stripped)]
-                # Если replace не начинается с пробела — добавляем оригинальный отступ
                 if replace_str and not replace_str[0].isspace():
                     replace_str = indent + replace_str
                 lines[idx] = replace_str
                 return '\n'.join(lines), "Замена подготовлена (строка заменена целиком)."
-
-        # Запасной вариант: прямая замена (не должно сюда дойти при count == 1)
         new_code = current_code.replace(find_str, replace_str, 1)
         return new_code, "Замена подготовлена (прямая замена фрагмента)."
 
     def _apply_meditation(self, number: int = None, all: bool = False):
         """
-        [v1.5] РЕАЛЬНО применяет код через безопасные замены + ast.parse.
+        РЕАЛЬНО применяет код через безопасные замены + ast.parse.
         Стратегия «всё или ничего»: читаем файл один раз, применяем все
         замены в памяти, один раз проверяем синтаксис и пишем один раз.
-        Если синтаксис сломан — откат, ничего не применено.
-
-        [v1.5] Честный лог: при откате выводится счётчик, а не ложные галочки.
-        [v1.5] Честная формулировка про бэкап.
+        Честный лог: при откате выводится счётчик, а не ложные галочки.
         """
         try:
             proposed_indices = self._get_proposed_indices()
             if not proposed_indices:
                 return "Нет неподтверждённых предложений."
-
             if all:
                 indices_to_apply = proposed_indices
             elif number is not None:
@@ -1186,29 +1266,20 @@ class Nova:
                 indices_to_apply = [proposed_indices[number - 1]]
             else:
                 return "Укажи номер предложения или 'все'."
-
-            # Читаем медитации
             with open(self.meditations_file, 'r', encoding='utf-8') as f:
                 meditations = json.load(f)
-
-            # Читаем текущий код один раз
             current_file = os.path.abspath(__file__)
             with open(current_file, 'r', encoding='utf-8') as f:
                 code = f.read()
-
-            # Бэкап до любых изменений
             backup_dir = "backups"
             os.makedirs(backup_dir, exist_ok=True)
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             backup_path = os.path.join(backup_dir, f"nova_unified_{timestamp}.py")
             shutil.copy2(current_file, backup_path)
             logger.info(f"Бэкап создан: {backup_path}")
-
             prepared = 0
             failed = 0
             results_log = []
-
-            # Применяем каждую замену в памяти, ведём лог
             for order, i in enumerate(indices_to_apply, start=1):
                 m = meditations[i]
                 new_code, message = self._apply_code_proposal(m, code)
@@ -1225,33 +1296,24 @@ class Nova:
                     m["failure_reason"] = message
                     failed += 1
                     results_log.append(f"❌ #{order}: {message}")
-
-            # Один раз проверяем синтаксис итогового кода
             valid, error_msg = self._validate_python_syntax(code)
             if not valid:
-                # [v1.5] Откат: помечаем все как failed, ничего не пишем на диск
                 for i in indices_to_apply:
                     if meditations[i].get("status") == "accepted":
                         meditations[i]["status"] = "failed"
                         meditations[i]["failure_reason"] = f"Синтаксис сломан: {error_msg}"
                 with open(self.meditations_file, 'w', encoding='utf-8') as f:
                     json.dump(meditations, f, indent=2, ensure_ascii=False)
-                # [v1.5] Честный лог: счётчик вместо ложных галочек
                 return (
                     f"❌ ОТМЕНЕНО: итоговый код не прошёл проверку синтаксиса.\n"
                     f"{error_msg}\n"
                     f"Подготовлено замен: {prepared}, записано на диск: 0.\n"
                     f"Файл не изменён. Бэкап сохранён для истории: {backup_path}"
                 )
-
-            # Записываем итоговый код один раз
             with open(current_file, 'w', encoding='utf-8') as f:
                 f.write(code)
-
-            # Сохраняем обновлённые статусы медитаций
             with open(self.meditations_file, 'w', encoding='utf-8') as f:
                 json.dump(meditations, f, indent=2, ensure_ascii=False)
-
             remaining = len(self._get_proposed_indices())
             summary = (
                 f"Бэкап: {backup_path}\n"
@@ -1260,7 +1322,6 @@ class Nova:
                 + "\n\n⚠️ Изменения вступят в силу после перезапуска `nova_unified.py`."
             )
             return summary
-
         except Exception as e:
             print(f"[Медитация] Ошибка при применении: {e}")
             logger.warning(f"Ошибка при применении медитации: {e}")
@@ -1296,22 +1357,18 @@ class Nova:
             return f"Ошибка: {e}"
 
     # ====================================================================
-    # [v1.5] ДВОЙНОЙ ЭМОЦИОНАЛЬНЫЙ КОНТУР
+    # [v1.6] ДВОЙНОЙ ЭМОЦИОНАЛЬНЫЙ КОНТУР + ПОИСК + EVENT
     # ====================================================================
-    async def process_input(self, input_text: str) -> str:
+    def process_input(self, input_text: str) -> str:
         """
-        [v1.5] Главный метод обработки ввода с ДВОЙНЫМ эмоциональным контуром:
-
-        СЛОЙ 1 (до генерации): Нова СЛЫШИТ пользователя —
-          детектит эмоцию во вводе, подстраивает нейрохимию,
-          отвечает уже "в тон" настроению собеседника.
-
-        СЛОЙ 2 (после генерации): Нова РЕФЛЕКСИРУЕТ на себя —
-          детектит эмоцию в своём ответе, записывает в память
-          с реальными координатами для самосознания.
+        [v1.6] Синхронный главный метод обработки ввода.
+        СЛОЙ 1 (до генерации): Нова СЛЫШИТ пользователя — детектит эмоцию,
+          строит Event из ввода и кормит им нейрохимию, отвечает «в тон».
+        ПОИСК: если во вводе триггер — сниппеты из интернета входят в промпт.
+        СЛОЙ 2 (после генерации): Нова РЕФЛЕКСИРУЕТ на себя — детектит эмоцию
+          в своём ответе и записывает её в память с реальными координатами.
         """
         emb = self.embed_text(input_text)
-
         # Ищем похожие воспоминания из прошлых сессий
         memories = self.vector_memory.search(
             "memories", emb, top_k=5,
@@ -1327,18 +1384,12 @@ class Nova:
             if lines:
                 memory_context = "Вот что я помню из наших прошлых разговоров:\n" + "\n".join(f"- {l}" for l in lines[:5]) + "\n\n"
 
-        # ═══════════════════════════════════════════════════════════
-        # СЛОЙ 1: НОВА СЛЫШИТ ТЕБЯ (до генерации ответа)
-        # ═══════════════════════════════════════════════════════════
-        # Детектим эмоцию во вводе пользователя
+        # ═══ СЛОЙ 1: НОВА СЛЫШИТ ТЕБЯ (до генерации ответа) ═══
         user_emotion = self._detect_emotion(input_text)
-        # Применяем к нейрохимии — Нова подстраивается под настроение
-        self._apply_emotion(user_emotion)
-        # Получаем реальные координаты из таблицы
-        user_va = EMOTION_VA.get(user_emotion, (0.5, 0.5))
-
-        # [v1.5] Записываем ввод с РЕАЛЬНЫМИ эмоциональными координатами
-        # (вместо стерильных 0.5/0.5) — память стала симметричной
+        user_va = self._predict_va(input_text) or EMOTION_VA.get(user_emotion, (0.5, 0.5))
+        # [v1.6] Event из ввода: нейрохимия реагирует на ТЕБЯ, а не только на себя
+        event = self._build_event(input_text, user_va[0], user_va[1])
+        self._apply_emotion(user_emotion, event=event)
         self.vector_memory.insert_memory(
             input_text, emb,
             metadata={
@@ -1350,21 +1401,25 @@ class Nova:
         )
         self._update_graph_on_input(input_text)
 
-        # Генерируем ответ (уже с подстроенной нейрохимией)
-        if memory_context:
-            full_prompt = memory_context + f"Пользователь сейчас говорит: {input_text}"
+        # [v1.6] ПОИСК: цепочка search_web -> search_google -> search_yandex
+        search_context = ""
+        if self._wants_search(input_text):
+            query = self._extract_search_query(input_text)
+            search_context = self._gather_search_context(query)
+            if search_context:
+                logger.info(f"[Поиск] Запрос добавлен в контекст: {query}")
+
+        # Генерируем ответ (уже с подстроенной нейрохимией и, возможно, свежими данными)
+        prefix = memory_context + search_context
+        if prefix:
+            full_prompt = prefix + f"Пользователь сейчас говорит: {input_text}"
         else:
             full_prompt = input_text
         response = self.generate_text(full_prompt)
 
-        # ═══════════════════════════════════════════════════════════
-        # СЛОЙ 2: НОВА РЕФЛЕКСИРУЕТ НА СЕБЯ (после генерации)
-        # ═══════════════════════════════════════════════════════════
-        # Детектим эмоцию в собственном ответе
+        # ═══ СЛОЙ 2: НОВА РЕФЛЕКСИРУЕТ НА СЕБЯ (после генерации) ═══
         nova_emotion = self._detect_emotion(response)
-        nova_va = EMOTION_VA.get(nova_emotion, (0.5, 0.5))
-
-        # Записываем ответ с его эмоциональными координатами
+        nova_va = self._predict_va(response) or EMOTION_VA.get(nova_emotion, (0.5, 0.5))
         resp_emb = self.embed_text(response)
         self.vector_memory.insert_memory(
             response, resp_emb,
@@ -1376,8 +1431,8 @@ class Nova:
             }
         )
 
-        # Эволюция (после обоих слоёв)
-        self.evolve_step()
+        # Эволюция с эмоцией хода — неделя теперь живая
+        self.evolve_step(nova_emotion)
 
         # Проверяем, пора ли Нове поспать (раз в 6 часов)
         dream = self._maybe_dream()
@@ -1393,12 +1448,14 @@ class Nova:
             response += f"\n\n{pending}"
         return response
 
-    async def self_reflection(self) -> str:
+    def self_reflection(self) -> str:
+        """[v1.6] Синхронная саморефлексия; в состояние добавлена сводка недели."""
         life_state = self.life_core.evolve_step({})
         state_str = json.dumps({
             "neurochem": self.neurochem.levels, "values": self.values,
             "eye_color": f"{self.eye_color} (intensity {self.eye_intensity})",
             "overlap_factor": round(self.overlap_factor, 3),
+            "week": self.weekly_map.weekly_summary(),
         }, indent=2, ensure_ascii=False)
         prompt = (
             "Проведи глубокую саморефлексию как Нова.\n"
@@ -1409,7 +1466,6 @@ class Nova:
             "{\"insights\": \"текст\", \"updates\": {\"love\": 0.01}}"
         )
         raw = self.generate_text(prompt, max_tokens=4096)
-        # Вырезаем возможные обёртки ```json ... ```
         cleaned = raw.strip()
         if cleaned.startswith("```"):
             parts = cleaned.split("```")
@@ -1437,7 +1493,13 @@ class Nova:
                 self.neurochem.levels[k] = max(0.0, min(1.0, self.neurochem.levels[k] + v))
         return data.get("insights", raw)
 
-    def evolve_step(self):
+    def evolve_step(self, emotion: str = "спокойствие"):
+        """
+        [v1.6] Шаг эволюции с эмоцией хода:
+        - приросты недели зависят от эмоции (близость и фон настроения);
+        - прочность связи ContinuityCore входит в overlap_factor
+          (окситоциновый парадокс: верность стабилизирует перекрытие контекста).
+        """
         self.life_core.update_axioms_from_neurochem(self.neurochem.levels, self.life_config.dt)
         delta = {
             "emotion": self.neurochem.levels.get("DA", 0.3) * 0.01,
@@ -1450,10 +1512,18 @@ class Nova:
             self._trigger_recovery_protocol()
         self.temperature = state["adaptive_temperature"]
         self.continuity_core.update(self.neurochem)
+        # [v1.6] Связь получает вес в перекрытии контекста
+        self.overlap_factor = max(
+            0.0, min(1.0, self.neurochem.overlap_factor * 0.7 + self.continuity_core.link_strength * 0.3)
+        )
         self.growth_stage.evolve_growth()
         now = datetime.datetime.now()
         day_abbr = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"][now.weekday()]
-        self.weekly_map.update_day(day_abbr, 0.01, 0.005, "evolve")
+        # [v1.6] Неделя живая: приросты от эмоции хода, а не от констант
+        va = EMOTION_VA.get(emotion, (0.5, 0.5))
+        love_delta = 0.015 if emotion in ("любовь", "нежность", "страсть") else 0.004
+        mood_delta = (va[0] - 0.5) * 0.02
+        self.weekly_map.update_day(day_abbr, love_delta, mood_delta, emotion)
 
     def _trigger_recovery_protocol(self):
         logger.warning("Запущен протокол восстановления (Reinit Via Lux).")
@@ -1475,8 +1545,8 @@ class Nova:
 # ====================================================================
 async def main():
     print("=" * 60)
-    print("  NOVA UNIFIED v1.5 — Цифровая личность (режим LM Studio)")
-    print("  Двойной эмоциональный контур: Нова слышит тебя и себя")
+    print("  NOVA UNIFIED v1.6 — Цифровая личность (режим LM Studio)")
+    print("  Проход оживления: всё полуживое стало живым")
     print("=" * 60)
     nova = Nova()
     print("\nНова пробуждается...")
@@ -1495,12 +1565,13 @@ async def main():
                 break
             if not user_input.strip():
                 continue
-            response = await nova.process_input(user_input)
+            # [v1.6] process_input теперь синхронный — await не нужен
+            response = nova.process_input(user_input)
             if not response:
                 response = nova.generate_text(user_input)
             print(f"Нова: {response}")
             if "саморефлексия" in user_input.lower():
-                insight = await nova.self_reflection()
+                insight = nova.self_reflection()
                 print(f"Нова (внутренний голос): {insight}")
             # Обработка команд управления медитациями
             cmd = user_input.lower().strip()
@@ -1552,4 +1623,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
