@@ -1,28 +1,32 @@
 """
-NOVA UI v1.6 — веб-интерфейс чата с Новой на Gradio (совместим с ядром Nova v1.5+).
+NOVA UI v1.7.1 — веб-интерфейс чата с Новой на Gradio (ядро Nova v1.5/v1.6, Gradio 6).
 
-ФИНАЛЬНЫЕ ПРАВКИ ИНТЕРФЕЙСА (всё разом, больше не докручиваем):
-1. Интерфейс НЕ замирает во время долгой генерации и медитаций:
-   обработчики синхронные (Gradio уносит их в отдельный поток),
-   а async-методы ядра, внутри которых нет ни одного await,
-   докручиваются в локальном event loop через _await_if_needed.
-   Если ядро потом станет синхронным — код продолжит работать как есть.
-2. Кнопки "Применить"/"Отклонить" обновляют панель состояния
-   (state_display добавлен в outputs).
-3. gr.Chatbot явно получает type="messages" — совместимо с Gradio 4.x и 5.x.
-4. ConcurrencyLimiter(1): отправка сообщений и саморефлексия сериализуются,
-   нейрохимия Новы защищена от параллельной порчи двойными кликами.
-5. Очистка истории ВЫРЕЗАЕТ служебные блоки (баннер предложений, медитацию)
-   из текста ответа, а не удаляет сообщение целиком — ответ Новы сохраняется.
-6. Выбор номера предложения для применения/отклонения.
-7. Панель состояния показывает ВСЕ 9 нейромедиаторов + производные
-   (overlap_factor, температура, ценности, стадия, сны, счётчик предложений).
+ИЗМЕНЕНИЯ v1.7.1:
+1. Исправлено падение кнопок "Применить"/"Отклонить": Gradio 6 может передавать
+   content сообщения списком, а не строкой — добавлен нормализатор _as_text.
+2. Обработчики кнопок больше не роняют интерфейс: любая ошибка выводится
+   ТЕКСТОМ в поле "Результат", а не красной пилюлей Gradio.
+3. Поле "Номер предложения" нельзя накрутить ниже 1 (minimum=1).
+4. Кнопка "Показать список предложений" — выводит все текущие предложения
+   с номерами, чтобы всегда было видно, какой номер вводить.
+5. При номере вне диапазона к ответу автоматически доклеивается список.
+6. Совместимость с Gradio 6: без type="messages", ConcurrencyLimiter
+   создаётся через try/except (в шестёрке класса может не быть).
+7. Совместимость с ядром: и с async (v1.5), и с sync (v1.6) методами —
+   обёртка _await_if_needed сама понимает, что ей дали.
 
 ЗАПУСК:
 1) pip install gradio
 2) python nova_ui.py
 3) Браузер откроется на http://127.0.0.1:7860
 """
+import os
+
+# [VPN-стойкость] localhost всегда ходит напрямую, мимо любого прокси
+# (VPN, системный прокси, антивирус-вебщит). Без этих строк включённый VPN
+# уводит проверочный запрос Gradio через прокси и сервер падает с кодом 502.
+os.environ["NO_PROXY"] = "localhost,127.0.0.1,::1"
+os.environ["no_proxy"] = "localhost,127.0.0.1,::1"
 
 import asyncio
 import inspect
@@ -32,31 +36,25 @@ import gradio as gr
 from nova_unified import Nova
 
 # Инициализируем Нову один раз при старте UI.
-# (Если LM Studio выключена — Нова поднимется на запасных эмбеддингах,
-#  это ожидаемое поведение ядра, не ошибка интерфейса.)
 nova = Nova()
 
 # Служебные маркеры: блоки, которые Нова доклеивает в конец ответа
 # и которые не должны висеть в истории после решения по медитации.
 SERVICE_MARKERS = ("📋 *У Новы есть", "🧘 *Нова медитирует")
 
-# Ограничитель параллельности: длинные операции, меняющие нейрохимию,
-# идут строго по одной, чтобы не топтать состояние Новы вдвоём.
+# Ограничитель параллельности: в новых Gradio класса может не быть,
+# тогда используем обычное число 1 (валидно и в 5.x, и в 6.x).
 try:
     chat_limiter = gr.ConcurrencyLimiter(limit=1)
 except AttributeError:
-    # В новых версиях Gradio класс убрали — остаётся числовой лимит на событиях
     chat_limiter = 1
 
 
 def _await_if_needed(result):
     """
-    Методы ядра сейчас объявлены как async, но внутри них нет ни одного
-    await (все вызовы синхронные: HTTP к LM Studio, Milvus, файлы).
-    Gradio выполняет синхронные обработчики в отдельном потоке, где нет
-    работающего event loop, поэтому asyncio.run здесь безопасен и не
-    замораживает интерфейс. Если ядро однажды станет синхронным —
-    значение просто пройдёт насквозь без изменений.
+    Если ядро синхронное — значение проходит насквозь.
+    Если ядро async — докручиваем корутину в локальном event loop
+    (Gradio выполняет синхронные обработчики в отдельном потоке).
     """
     if inspect.isawaitable(result):
         return asyncio.run(result)
@@ -98,27 +96,33 @@ def get_state_display():
     return text
 
 
-def respond(message, chat_history):
-    """Обработка сообщения пользователя (синхронная: Gradio уносит в поток)."""
-    if not message or not message.strip():
-        return "", chat_history, get_state_display()
+def _safe_state():
+    """Панель состояния, которая никогда не роняет обработчик."""
     try:
-        response = _await_if_needed(nova.process_input(message))
+        return get_state_display()
     except Exception as e:
-        response = f"Ой, что-то пошло не так: {e}"
-    chat_history = (chat_history or []) + [
-        {"role": "user", "content": message},
-        {"role": "assistant", "content": response},
-    ]
-    return "", chat_history, get_state_display()
+        return f"### 🌸 Панель состояния временно недоступна: {e}"
 
 
-def run_reflection():
-    """Запуск саморефлексии Новы."""
-    try:
-        return _await_if_needed(nova.self_reflection())
-    except Exception as e:
-        return f"Ошибка рефлексии: {e}"
+def _as_text(content) -> str:
+    """
+    [v1.7.1] Gradio 6 может передавать content сообщения не строкой,
+    а списком (мультимодальный формат) или словарём. Нормализуем всё
+    в строку, чтобы .find() и компания никогда не падали.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                parts.append(str(item.get("text", "")))
+        return "\n".join(p for p in parts if p)
+    if isinstance(content, dict):
+        return str(content.get("text", ""))
+    return "" if content is None else str(content)
 
 
 def _strip_service_blocks(text: str) -> str:
@@ -137,15 +141,15 @@ def _strip_service_blocks(text: str) -> str:
 def _clean_history(chat_history):
     """
     Убирает из истории служебные блоки после решения по медитации.
-    ВАЖНО: сообщение не удаляется целиком — вырезается только баннер,
-    ответ Новы остаётся в чате.
+    Сообщение НЕ удаляется целиком — вырезается только баннер.
+    [v1.7.1] content сначала нормализуется в строку через _as_text.
     """
     if not chat_history:
         return chat_history
     cleaned = []
     for msg in chat_history:
         if isinstance(msg, dict) and msg.get("role") == "assistant":
-            new_content = _strip_service_blocks(msg.get("content", ""))
+            new_content = _strip_service_blocks(_as_text(msg.get("content", "")))
             if new_content.strip():
                 cleaned.append({**msg, "content": new_content})
             # если после вырезания текст пуст — сообщение не добавляем
@@ -155,29 +159,77 @@ def _clean_history(chat_history):
 
 
 def _parse_number(number) -> int:
-    """Безопасно превращает значение поля номера в целое."""
+    """Безопасно превращает значение поля номера в целое (не меньше 1)."""
     try:
-        return int(number) if number not in (None, "") else 1
+        value = int(number) if number not in (None, "") else 1
     except (TypeError, ValueError):
         return 1
+    return max(1, value)
+
+
+def _enrich_with_list(result: str) -> str:
+    """Если номер мимо или предложений нет — доклеиваем актуальный список."""
+    if any(k in result for k in ("Номер должен", "Нет неподтверждённых", "Укажи номер")):
+        listing = nova._check_pending_meditations()
+        if listing:
+            result += "\n" + listing
+    return result
+
+
+def show_list():
+    """Кнопка 'Показать список': все текущие предложения с номерами."""
+    try:
+        listing = nova._check_pending_meditations()
+        return listing if listing else "Сейчас нет неподтверждённых предложений по коду."
+    except Exception as e:
+        return f"Ошибка: {e}"
+
+
+def respond(message, chat_history):
+    """Обработка сообщения пользователя (синхронная: Gradio уносит в поток)."""
+    if not message or not message.strip():
+        return "", chat_history, _safe_state()
+    try:
+        response = _await_if_needed(nova.process_input(message))
+    except Exception as e:
+        response = f"Ой, что-то пошло не так: {e}"
+    chat_history = (chat_history or []) + [
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": response},
+    ]
+    return "", chat_history, _safe_state()
+
+
+def run_reflection():
+    """Запуск саморефлексии Новы."""
+    try:
+        return _await_if_needed(nova.self_reflection())
+    except Exception as e:
+        return f"Ошибка рефлексии: {e}"
 
 
 def handle_apply(chat_history, number):
-    """Кнопка 'Применить': применяет предложение и обновляет панель."""
+    """Кнопка 'Применить'. Полностью защищена от падений наружу."""
     try:
         result = nova._apply_meditation(number=_parse_number(number))
+        result = _enrich_with_list(result)
+        history = _clean_history(chat_history)
     except Exception as e:
         result = f"Ошибка: {e}"
-    return result, _clean_history(chat_history), get_state_display()
+        history = chat_history
+    return result, history, _safe_state()
 
 
 def handle_reject(chat_history, number):
-    """Кнопка 'Отклонить': отклоняет предложение и обновляет панель."""
+    """Кнопка 'Отклонить'. Полностью защищена от падений наружу."""
     try:
         result = nova._reject_meditation(number=_parse_number(number))
+        result = _enrich_with_list(result)
+        history = _clean_history(chat_history)
     except Exception as e:
         result = f"Ошибка: {e}"
-    return result, _clean_history(chat_history), get_state_display()
+        history = chat_history
+    return result, history, _safe_state()
 
 
 def clear_chat():
@@ -217,19 +269,21 @@ with gr.Blocks(title="Нова") as demo:
                 label="Номер предложения",
                 value=1,
                 precision=0,
+                minimum=1,
             )
             with gr.Row():
                 apply_btn = gr.Button("✅ Применить", variant="primary")
                 reject_btn = gr.Button("❌ Отклонить")
+            list_btn = gr.Button("📋 Показать список предложений")
             meditation_result = gr.Textbox(
                 label="Результат",
-                lines=3,
+                lines=6,
                 interactive=False,
             )
 
-    # Обработчики. Длинные операции (чат, рефлексия) идут через ограничитель,
-    # чтобы не менять состояние Новы параллельно. Кнопка "Обновить состояние"
-    # сознательно оставлена БЕЗ ограничителя — она должна отвечать мгновенно.
+    # Обработчики. Длинные операции (чат, рефлексия) идут через ограничитель.
+    # "Обновить состояние" и "Показать список" сознательно без ограничителя —
+    # они должны отвечать мгновенно.
     msg.submit(
         respond,
         inputs=[msg, chatbot],
@@ -267,6 +321,11 @@ with gr.Blocks(title="Нова") as demo:
         handle_reject,
         inputs=[chatbot, med_number],
         outputs=[meditation_result, chatbot, state_display],
+    )
+    list_btn.click(
+        show_list,
+        inputs=None,
+        outputs=[meditation_result],
     )
 
 if __name__ == "__main__":
